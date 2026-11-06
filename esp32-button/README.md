@@ -35,6 +35,11 @@ Edit the top of `button.ino`:
 
 - Button: one leg to `BUTTON_PIN`, other leg to GND. Firmware uses
   `INPUT_PULLUP`, so no external resistor needed.
+- Debounce capacitor: ~100 nF ceramic, wired in parallel across the
+  button's two legs. The firmware already does a 250ms software debounce,
+  so this is extra insurance against contact bounce/electrical noise on a
+  button that'll get mashed by strangers all day — not strictly required,
+  but cheap and worth it.
 - LED: `LED_PIN` → series resistor (~220–330 Ω) → LED → GND.
 - OLED: I2C (SDA/SCL as configured above) — likely already wired on-board
   if it's an integrated combo module.
@@ -45,7 +50,7 @@ Edit the top of `button.ino`:
 
 ### Trigger wiring diagram
 
-![Zapojení spouště](wiring.jpg)
+![Trigger wiring](wiring.jpg)
 
 The button and LED are the only things that need wiring by hand on most
 combo boards — the OLED is normally already soldered to the same PCB.

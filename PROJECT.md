@@ -66,6 +66,8 @@ selectable via a tablet touchscreen.
   `Ready <ip>`, then `Divej se!` while armed, `Fotim...` while capturing,
   then the result for ~1.5s. Auto-reconnects on WiFi drop; restarts itself
   only if disconnected for 2+ minutes straight.
+  Wiring also includes a ~100nF capacitor in parallel across the button
+  for hardware debounce, on top of the firmware's 250ms software debounce.
   See `esp32-button/README.md` (now includes a wiring diagram, `wiring.jpg`)
   for wiring and flashing steps.
 - **Not yet done:** WIFI_SSID/PASSWORD and NUC_HOST placeholders need real
