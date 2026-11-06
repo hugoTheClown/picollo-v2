@@ -118,7 +118,7 @@ Flashed from a separate machine (Arduino IDE), not from the NUC:
 2. Library Manager → install **Adafruit SSD1306** and **Adafruit GFX
    Library** (OLED status display).
 3. Board: "ESP32C3 Dev Module" (or the specific board variant).
-4. Open `esp32-button/button.ino`, fill in WiFi/NUC config, upload.
+4. Open `esp32-button/button/button.ino`, fill in WiFi/NUC config, upload.
 
 Full wiring, pinout, and flashing details: `esp32-button/README.md`.
 

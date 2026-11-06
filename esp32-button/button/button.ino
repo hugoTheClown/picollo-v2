@@ -91,17 +91,26 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
+  Serial.println("\nPicollo button booting...");
+
   Wire.begin(OLED_SDA, OLED_SCL);
-  display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR);
+  if (display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR)) {
+    Serial.println("OLED init OK");
+  } else {
+    Serial.println("OLED init FAILED (check OLED_SDA/OLED_SCL/OLED_I2C_ADDR)");
+  }
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   drawStatus("Booting...", "");
 
+  Serial.print("Connecting to WiFi SSID: ");
+  Serial.println(WIFI_SSID);
   connectWifi();
   disconnectedSince = millis();
 }
 
 void armLiveview() {
+  Serial.println("Button press 1: arming liveview...");
   drawStatus(line1, "Zapínám...");
   if (postTo("/liveview/start")) {
     state = ARMED;
@@ -121,6 +130,7 @@ void disarmLiveview() {
 }
 
 void triggerCapture() {
+  Serial.println("Button press 2: capturing...");
   state = CAPTURING;
 
   HTTPClient http;
@@ -129,6 +139,8 @@ void triggerCapture() {
   http.setTimeout(10000);
   int code = http.POST("");
   http.end();
+  Serial.print("Capture result code: ");
+  Serial.println(code);
 
   if (code == 200) {
     line2 = "Vyfoceno!";
@@ -166,15 +178,23 @@ void loop() {
 
     if (now - lastWifiAttempt > WIFI_RETRY_MS) {
       lastWifiAttempt = now;
+      Serial.print("WiFi not connected (status=");
+      Serial.print(WiFi.status());
+      Serial.println("), retrying...");
       WiFi.reconnect();
     }
 
     if (now - disconnectedSince > WIFI_GIVE_UP_MS) {
+      Serial.println("WiFi still down after timeout, restarting...");
       ESP.restart();
     }
     return;
   }
 
+  if (disconnectedSince != 0) {
+    Serial.print("WiFi connected, IP: ");
+    Serial.println(WiFi.localIP());
+  }
   disconnectedSince = 0;
   updateLed(now);
 

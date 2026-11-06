@@ -58,7 +58,7 @@ selectable via a tablet touchscreen.
   feed, so the guest can see themselves); second press takes the actual
   photo (liveview auto-stops as part of that). Auto-disarms after ~20s if
   nobody follows through with the second press.
-- **Implemented** (2026-11-06): `~/photobooth/esp32-button/button.ino`.
+- **Implemented** (2026-11-06): `~/photobooth/esp32-button/button/button.ino`.
   Button on `INPUT_PULLUP` (default GPIO4), separate status **LED**
   (default GPIO7: solid while armed/liveview, fast blink while capturing,
   off when idle) — both avoid the C3's strapping pins 2/8/9. First press →
@@ -70,11 +70,26 @@ selectable via a tablet touchscreen.
   for hardware debounce, on top of the firmware's 250ms software debounce.
   See `esp32-button/README.md` (now includes a wiring diagram, `wiring.jpg`)
   for wiring and flashing steps.
-- **Not yet done:** WIFI_SSID/PASSWORD and NUC_HOST placeholders need real
-  values; the OLED's I2C pins/resolution in the sketch are unconfirmed
-  guesses (GPIO5/6, 128x64) pending the exact board/listing; untested on
-  real hardware — no ESP32-C3 attached to this NUC session and no Arduino
-  toolchain installed here.
+- **Board arrived & flashed (2026-11-06):** plugged into the NUC itself
+  (not a separate machine). Installed `arduino-cli` (user-local, no root)
+  + the `esp32:esp32` core + libraries, and wrote
+  `esp32-button/flash.py` to compile/upload from the NUC CLI (needed since
+  this session is SSH-only, no GUI for the Arduino IDE). Sketch had to move
+  to `esp32-button/button/button.ino` — Arduino requires the sketch folder
+  name to match the `.ino` filename. Serial access needs the `dialout`
+  group; used `sg dialout -c '...'` to avoid requiring a relogin mid-session.
+  **Found & fixed:** `Serial.print()` silently produced no output until
+  compiled with the `CDCOnBoot=cdc` board option — undocumented-by-default
+  C3 gotcha, now baked into `flash.py`.
+- **Confirmed on real hardware:** boots, `OLED init OK` over serial — the
+  guessed I2C pins/address (GPIO5/6, 0x3C) are correct for this board.
+  Wi-Fi retry loop behaves as designed (looping, since it's still pointed
+  at placeholder creds).
+- **Not yet done:** fill in real `WIFI_SSID`/`WIFI_PASSWORD`/`NUC_HOST` in
+  the sketch and reflash; visually confirm `SCREEN_WIDTH`/`SCREEN_HEIGHT`
+  (128x64 assumed) actually matches what's drawn on the physical display;
+  wire up and test the button, LED, and debounce capacitor (OLED-only
+  verified so far).
 
 ## Listener service (NUC)
 

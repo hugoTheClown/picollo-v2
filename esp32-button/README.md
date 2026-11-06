@@ -18,7 +18,7 @@ See `../PROJECT.md` for the overall design.
 
 ## Before flashing
 
-Edit the top of `button.ino`:
+Edit the top of `button/button.ino`:
 
 - `WIFI_SSID` / `WIFI_PASSWORD` — the booth's private AP credentials.
 - `NUC_HOST` — the NUC's IP address on that AP (static/reserved, not DHCP-drifting).
@@ -59,25 +59,48 @@ rerun it if the pinout above changes.)
 
 ## Flashing
 
-Needs the Arduino IDE (or `arduino-cli`) with the ESP32 board package
-installed, targeting "ESP32C3 Dev Module" (or the board's specific variant
-if listed). Not done from this NUC session — no ESP32-C3 attached here and
-no Arduino toolchain installed.
+### From the NUC (`flash.py`) — if the board is plugged into the NUC itself
 
-Library Manager dependencies: **Adafruit SSD1306** and **Adafruit GFX
-Library**.
+```sh
+python3 flash.py            # auto-detects /dev/ttyACM*/ttyUSB*, compiles, uploads
+python3 flash.py --watch    # same, then streams serial output for 10s after
+```
 
-Board-settings gotcha specific to C3: if Serial output over the native USB
-port looks empty, enable "USB CDC On Boot" in Tools → USB CDC On Boot.
+Needs `arduino-cli` (`~/.local/bin/arduino-cli`), the `esp32:esp32` core,
+and the two libraries below — one-time setup:
 
-1. Install the ESP32 core in Arduino IDE (Boards Manager → "esp32" by
-   Espressif Systems) and the two libraries above.
-2. Select the correct board/port, open `button.ino`, fill in the config
-   (including the OLED values above), upload.
-3. Watch the display/LED through the sequence in "How the trigger works"
-   above.
+```sh
+arduino-cli core install esp32:esp32
+arduino-cli lib install "Adafruit SSD1306" "Adafruit GFX Library"
+```
+
+Serial-port access needs the `dialout` group (`sudo usermod -aG dialout
+$USER`, then log out and back in — or prefix commands with `sg dialout -c
+'...'` to pick it up immediately without a relogin).
+
+`flash.py` always builds with `CDCOnBoot=cdc` — **required** on the C3 for
+`Serial.print()` to actually reach the USB port; without it the firmware's
+own debug output silently goes nowhere (confirmed on real hardware: only
+ESP-IDF's internal Wi-Fi log lines showed up until this was set).
+
+### From the Arduino IDE (a separate machine with a GUI)
+
+1. Boards Manager → install **esp32** (Espressif Systems). Library Manager
+   → install **Adafruit SSD1306** and **Adafruit GFX Library**.
+2. Board: "ESP32C3 Dev Module" (or the board's specific variant if listed).
+   **Tools → USB CDC On Boot → Enabled** (see note above).
+3. Open `button/button.ino`, fill in the config, select the port, upload.
+
+Either way, watch the display/LED through the sequence in "How the trigger
+works" above; `flash.py --watch` (or `arduino-cli monitor -p <port> -c
+baudrate=115200`) also shows boot/Wi-Fi/capture logging over serial.
 
 ## Status
 
-Implemented but **untested on real hardware** — board not yet in hand, and
-the OLED pinout/resolution values are unconfirmed placeholders.
+**Flashed and boot-verified on real hardware (2026-11-06):** compiles,
+uploads, and boots via `flash.py` from the NUC. Confirmed on serial:
+`OLED init OK` — the guessed I2C pins/address (GPIO5/6, 0x3C) are correct
+for this board. Still open: `WIFI_SSID`/`WIFI_PASSWORD`/`NUC_HOST` are
+placeholders (board currently loops retrying Wi-Fi), `SCREEN_WIDTH`/
+`SCREEN_HEIGHT` (128x64) aren't visually confirmed yet, and the button/LED/
+capacitor wiring hasn't been tested — OLED-only so far.
