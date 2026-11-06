@@ -139,19 +139,29 @@ photobooth/
 
 ## Usage
 
-**Trigger a capture manually** (e.g. to test without the physical button):
+**Control panel** — `http://<nuc-ip>:8080/` (e.g. `http://10.0.2.10:8080/`).
+Operator-facing page: listener/camera status, photos-today count, last
+capture result, a "Vyfotit" button to trigger a capture manually, and a
+short how-it-works summary. This is what you'd open from a laptop/phone on
+the booth network to check on things during an event.
+
+**Kiosk display** — `http://<nuc-ip>:8080/kiosk`. Guest-facing fullscreen
+live camera preview with a "📸 Picollo" banner; this is what the kiosk
+browser on the NUC itself shows (`~/.xinitrc` points `chromium --kiosk`
+here).
+
+**Trigger a capture from the command line** (same effect as the button or
+the control-panel button):
 
 ```sh
 curl -s -X POST http://localhost:8080/capture
 ```
 
-**Watch the live preview** in a browser (also what the kiosk shows):
-`http://<nuc-ip>:8080/`
-
-**Check the listener is alive:**
+**Check status programmatically:**
 
 ```sh
-curl -s http://localhost:8080/health
+curl -s http://localhost:8080/health   # liveness
+curl -s http://localhost:8080/status   # photos today + last capture, as JSON
 ```
 
 **Restart the listener after editing `app.py`:**
@@ -161,8 +171,8 @@ systemctl --user restart photobooth-listener.service
 ```
 
 **Button hardware:** once wired and flashed (see `esp32-button/README.md`),
-pressing it fires a capture the same way the `curl` command above does —
-the OLED shows `Ready <ip>` when idle and the result of each press.
+pressing it fires a capture the same way the commands above do — the OLED
+shows `Ready <ip>` when idle and the result of each press.
 
 Photos land in `photos/YYYY-MM-DD/HHMMSS.jpg`; upload/printing from there
 is future work, not yet implemented.
