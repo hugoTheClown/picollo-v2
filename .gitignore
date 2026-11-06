@@ -1,2 +1,3 @@
 photos/
 .claude/settings.local.json
+esp32-button/button/wifi_config.h

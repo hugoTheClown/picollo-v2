@@ -1,0 +1,6 @@
+// Copy this file to wifi_config.h (gitignored) and fill in real values.
+// wifi_config.h is intentionally NOT committed — it holds the booth WiFi
+// password, which shouldn't live in git history.
+
+#define WIFI_SSID "CHANGE_ME"
+#define WIFI_PASSWORD "CHANGE_ME"

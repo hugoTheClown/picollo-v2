@@ -18,18 +18,27 @@ See `../PROJECT.md` for the overall design.
 
 ## Before flashing
 
-Edit the top of `button/button.ino`:
+**WiFi credentials** (not in git — the password shouldn't live in history):
 
-- `WIFI_SSID` / `WIFI_PASSWORD` — the booth's private AP credentials.
+```sh
+cp button/wifi_config.h.example button/wifi_config.h
+# then edit button/wifi_config.h with the real SSID/password
+```
+
+**Copy the SSID exactly from the router's admin page, not from memory —
+SSIDs are case-sensitive, and a case mismatch produces a confusing
+"NO_AP_FOUND" (reason 201) that looks like a range/channel problem.**
+
+Edit the top of `button/button.ino` for everything else:
+
 - `NUC_HOST` — the NUC's IP address on that AP (static/reserved, not DHCP-drifting).
 - `BUTTON_PIN` (default GPIO4) and `LED_PIN` (default GPIO7) — fine for most
   C3 boards, but confirm they're free on the specific module (OLED wiring
   sometimes claims nearby pins).
 - `OLED_SDA` / `OLED_SCL` and `SCREEN_WIDTH` / `SCREEN_HEIGHT` — **must
-  confirm against the exact board bought**. These are guesses (GPIO5/6,
-  128x64). Many tiny "ESP32-C3 + 0.42in OLED" combo boards are actually
-  72x40 pixels with display pins hardwired on the PCB, not the display's
-  I2C address/size varying by vendor — check the product page/schematic.
+  confirm against the exact board bought**. Currently set to 72x40 (GPIO5/6
+  I2C pins confirmed correct on real hardware, but 72x40 renders garbled —
+  see Status below, still unresolved).
 
 ## Wiring
 
@@ -97,10 +106,18 @@ baudrate=115200`) also shows boot/Wi-Fi/capture logging over serial.
 
 ## Status
 
-**Flashed and boot-verified on real hardware (2026-11-06):** compiles,
-uploads, and boots via `flash.py` from the NUC. Confirmed on serial:
-`OLED init OK` — the guessed I2C pins/address (GPIO5/6, 0x3C) are correct
-for this board. Still open: `WIFI_SSID`/`WIFI_PASSWORD`/`NUC_HOST` are
-placeholders (board currently loops retrying Wi-Fi), `SCREEN_WIDTH`/
-`SCREEN_HEIGHT` (128x64) aren't visually confirmed yet, and the button/LED/
-capacitor wiring hasn't been tested — OLED-only so far.
+**Flashed, booted, and on Wi-Fi on real hardware (2026-11-06):** compiles,
+uploads, and connects via `flash.py` from the NUC. Confirmed on serial:
+`OLED init OK` (I2C pins/address correct) and `WiFi connected, IP:
+10.0.2.101`. Getting Wi-Fi working took three real fixes — see the dated
+log in `../PROJECT.md` (disconnect-reason event logging, explicit country
+code for the EU channel range, and a case-sensitive SSID typo as the
+actual root cause).
+
+**Still open:**
+- OLED renders at 72x40 but garbled/offset (e.g. `"Picollo"` showed as
+  `"Lo    ectir"`) — likely needs a column-offset fix for this specific
+  cheap-clone panel; not yet solved.
+- Button/LED/capacitor wiring not confirmed tested — no `/liveview/start`
+  or `/capture` request has been seen from the board in the NUC listener
+  logs yet, so unclear if the button itself is wired per `wiring.jpg`.

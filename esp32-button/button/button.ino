@@ -10,13 +10,11 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <esp_wifi.h>
+#include "wifi_config.h" // not in git — copy from wifi_config.h.example and fill in
 
-// ---- Fill these in before flashing ----
-const char *WIFI_SSID = "CHANGE_ME";
-const char *WIFI_PASSWORD = "CHANGE_ME";
 const char *NUC_HOST = "10.0.2.10"; // NUC's address on the booth AP — confirm it's a static/reserved lease, not DHCP-drifting
 const uint16_t NUC_PORT = 8080;
-// ----------------------------------------
 
 // Button: one leg to this pin, other leg to GND. ESP32-C3 strapping pins are
 // 2, 8, 9 — avoid those for inputs that must be stable at boot.
@@ -31,9 +29,10 @@ const uint8_t LED_PIN = 7;
 // actual module's schematic/listing before flashing.
 const uint8_t OLED_SDA = 5;
 const uint8_t OLED_SCL = 6;
-const uint8_t SCREEN_WIDTH = 128;
-const uint8_t SCREEN_HEIGHT = 64; // many tiny "0.42in" C3+OLED boards are
-                                   // actually 72x40 — check before flashing
+const uint8_t SCREEN_WIDTH = 72;
+const uint8_t SCREEN_HEIGHT = 40; // was 128x64 — I2C init ACKs either way,
+                                   // but nothing showed on-screen at 128x64,
+                                   // trying the common tiny-OLED size instead
 const uint8_t OLED_I2C_ADDR = 0x3C;
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
@@ -68,8 +67,35 @@ void drawStatus(const String &l1, const String &l2) {
   display.display();
 }
 
+void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    Serial.print("WiFi disconnected, reason=");
+    Serial.println(info.wifi_sta_disconnected.reason);
+  }
+}
+
+String wifiDots() {
+  String s = "WiFi";
+  int n = (millis() / 400) % 3 + 1;
+  for (int i = 0; i < n; i++) s += ".";
+  return s;
+}
+
 void connectWifi() {
   WiFi.mode(WIFI_STA);
+
+  // Default ESP-IDF channel policy can miss APs on channels 12/13, which
+  // many EU routers use — widen the scan range explicitly (CZ allows 1-13).
+  wifi_country_t country = {
+    .cc = "CZ",
+    .schan = 1,
+    .nchan = 13,
+    .max_tx_power = 20,
+    .policy = WIFI_COUNTRY_POLICY_MANUAL,
+  };
+  esp_wifi_set_country(&country);
+
+  WiFi.onEvent(onWifiEvent);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -101,7 +127,7 @@ void setup() {
   }
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-  drawStatus("Booting...", "");
+  drawStatus("Picollo", "Booting...");
 
   Serial.print("Connecting to WiFi SSID: ");
   Serial.println(WIFI_SSID);
@@ -172,9 +198,14 @@ void loop() {
   unsigned long now = millis();
 
   if (WiFi.status() != WL_CONNECTED) {
-    drawStatus("WiFi: reconnecting", "");
-    digitalWrite(LED_PIN, (now / 500) % 2); // slow blink = disconnected
     if (disconnectedSince == 0) disconnectedSince = now;
+
+    if (now - disconnectedSince > WIFI_GIVE_UP_MS - 3000) {
+      drawStatus("Picollo", "WiFi fail");
+    } else {
+      drawStatus("Picollo", wifiDots());
+    }
+    digitalWrite(LED_PIN, (now / 500) % 2); // slow blink = disconnected
 
     if (now - lastWifiAttempt > WIFI_RETRY_MS) {
       lastWifiAttempt = now;
@@ -208,16 +239,16 @@ void loop() {
 
   switch (state) {
     case IDLE:
-      drawStatus("Ready  " + WiFi.localIP().toString(), "");
+      drawStatus("Picollo", "Ready " + WiFi.localIP().toString());
       break;
     case ARMED:
-      drawStatus("Ready  " + WiFi.localIP().toString(), "Divej se!");
+      drawStatus("Picollo", "Divej se!");
       break;
     case CAPTURING:
-      drawStatus("Ready  " + WiFi.localIP().toString(), "Fotim...");
+      drawStatus("Picollo", "Fotim...");
       break;
     case SHOWING_RESULT:
-      drawStatus("Ready  " + WiFi.localIP().toString(), line2);
+      drawStatus("Picollo", line2);
       break;
   }
 

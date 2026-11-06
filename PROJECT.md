@@ -83,13 +83,32 @@ selectable via a tablet touchscreen.
   C3 gotcha, now baked into `flash.py`.
 - **Confirmed on real hardware:** boots, `OLED init OK` over serial — the
   guessed I2C pins/address (GPIO5/6, 0x3C) are correct for this board.
-  Wi-Fi retry loop behaves as designed (looping, since it's still pointed
-  at placeholder creds).
-- **Not yet done:** fill in real `WIFI_SSID`/`WIFI_PASSWORD`/`NUC_HOST` in
-  the sketch and reflash; visually confirm `SCREEN_WIDTH`/`SCREEN_HEIGHT`
-  (128x64 assumed) actually matches what's drawn on the physical display;
-  wire up and test the button, LED, and debounce capacitor (OLED-only
-  verified so far).
+- **Wi-Fi connected (2026-11-06):** `picollo` network, got IP via DHCP
+  (`10.0.2.101`; a reservation for `10.0.2.20` has since been added on the
+  router for next reconnect). Took three fixes to get there:
+  1. Added a `WiFi.onEvent()` handler logging the ESP-IDF disconnect
+     *reason* code (not just Arduino's generic `WiFi.status()`) —
+     essential for diagnosing this, turned a guessing game into a direct
+     answer each time.
+  2. Set an explicit country code (`CZ`, channels 1–13) — ESP-IDF's
+     default channel policy can miss APs on 12/13; turned out not to be
+     the actual cause here (router was on channel 3) but is a real EU
+     gotcha worth keeping regardless.
+  3. **Root cause:** `reason=201` (`NO_AP_FOUND`) persisted even at close
+     range — turned out the SSID is `picollo` (lowercase), but the sketch
+     had `Picollo` (capital P) from how it was first given verbally.
+     WiFi SSIDs are case-sensitive; always confirm against the router's
+     own admin page, not from memory/transcription.
+- **OLED at 72x40:** switched from the 128x64 guess (nothing rendered) to
+  72x40 (common for these tiny combo boards) — now something renders, but
+  garbled/offset (`"Lo    ectir"` instead of `"Picollo"`), a known issue
+  with cheap 72x40 SSD1306 clones needing a column-offset the stock
+  Adafruit_SSD1306 driver doesn't apply automatically. **Not yet solved.**
+- **Not yet done:** fix the OLED column-offset garbling; wire up and test
+  the button, LED, and debounce capacitor (OLED/Wi-Fi-only verified so
+  far — unclear if the button is physically wired yet, no `/liveview/
+  start` or `/capture` request has been seen from the board's IP in the
+  listener logs).
 
 ## Listener service (NUC)
 

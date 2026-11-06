@@ -81,10 +81,12 @@ def main():
 
     if watch_seconds is not None:
         print(f"Watching serial output for {watch_seconds}s (Ctrl+C to stop early)...")
+        # Plain `cat` on the raw device, not `arduino-cli monitor` — the
+        # latter produces no visible output when stdout isn't a real TTY
+        # (e.g. run from a script/non-interactive shell).
+        subprocess.run(["stty", "-F", port, "115200", "raw", "-echo"])
         try:
-            subprocess.run(
-                ["timeout", str(watch_seconds), cli, "monitor", "-p", port, "-c", "baudrate=115200"]
-            )
+            subprocess.run(["timeout", str(watch_seconds), "cat", port])
         except KeyboardInterrupt:
             pass
     else:
