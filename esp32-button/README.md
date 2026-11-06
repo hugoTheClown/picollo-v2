@@ -1,8 +1,20 @@
 # ESP32-C3 button firmware
 
-Sends `POST /capture` to the NUC listener when the physical button is pressed.
 Target board: **ESP32-C3 with onboard OLED** (provisional choice — "zatím").
 See `../PROJECT.md` for the overall design.
+
+## How the trigger works (two-stage)
+
+1. **First press** → arms liveview: POSTs `/liveview/start` to the NUC, so
+   the kiosk display switches from its idle screen to a live camera feed
+   (guest sees themselves). OLED shows `Divej se!`, status LED turns on solid.
+2. **Second press** → POSTs `/capture`, which takes the actual photo (the
+   NUC also stops liveview automatically as part of handling this). OLED
+   shows `Fotim...` then the result (`Vyfoceno!` / `Obsazeno, zkus znovu` /
+   `Chyba: <code>`), LED blinks fast during the shot then turns off.
+3. If nobody follows through with a second press within ~20s, the armed
+   state times out automatically (`/liveview/stop`), kiosk reverts to idle,
+   LED turns off.
 
 ## Before flashing
 
@@ -10,72 +22,35 @@ Edit the top of `button.ino`:
 
 - `WIFI_SSID` / `WIFI_PASSWORD` — the booth's private AP credentials.
 - `NUC_HOST` — the NUC's IP address on that AP (static/reserved, not DHCP-drifting).
-- `BUTTON_PIN` (default GPIO4) — fine for most C3 boards, but confirm it's
-  free on the specific module (OLED wiring sometimes claims nearby pins).
+- `BUTTON_PIN` (default GPIO4) and `LED_PIN` (default GPIO7) — fine for most
+  C3 boards, but confirm they're free on the specific module (OLED wiring
+  sometimes claims nearby pins).
 - `OLED_SDA` / `OLED_SCL` and `SCREEN_WIDTH` / `SCREEN_HEIGHT` — **must
   confirm against the exact board bought**. These are guesses (GPIO5/6,
   128x64). Many tiny "ESP32-C3 + 0.42in OLED" combo boards are actually
   72x40 pixels with display pins hardwired on the PCB, not the display's
   I2C address/size varying by vendor — check the product page/schematic.
 
-## Why no separate status LED
-
-The original plan was an onboard LED for WiFi-connected status. With an
-OLED now in the picture, the display shows richer status instead (WiFi
-state + IP, capture result) — the LED requirement is superseded, not
-dropped.
-
 ## Wiring
 
 - Button: one leg to `BUTTON_PIN`, other leg to GND. Firmware uses
   `INPUT_PULLUP`, so no external resistor needed.
+- LED: `LED_PIN` → series resistor (~220–330 Ω) → LED → GND.
 - OLED: I2C (SDA/SCL as configured above) — likely already wired on-board
   if it's an integrated combo module.
 - Power: USB or a 5V line to the ESP32 at the button stand (see
   `PROJECT.md`).
 - ESP32-C3 strapping pins are **2, 8, 9** — avoid reusing these for the
-  button or anything that must read stable at boot.
+  button, LED, or anything that must read stable at boot.
 
-### Trigger (button) wiring diagram
+### Trigger wiring diagram
 
-The button is the only thing that needs wiring by hand on most combo
-boards — the OLED is normally already soldered to the same PCB (its I2C
-pins below are shown for reference/confirmation, not a connection you
-have to make yourself).
+![Zapojení spouště](wiring.jpg)
 
-```
-                       ESP32-C3 + OLED combo board
-                  ┌───────────────────────────────────┐
-                  │                                    │
-   USB-C / 5V ────┤ 5V                                 │
-                  │                                    │
-          GND ────┤ GND ───────────────┬───────────────┤
-                  │                    │               │
-                  │           BUTTON_PIN (GPIO4) ───┐  │
-                  │                                 │  │
-                  │   OLED (on-board, for ref.):     │  │
-                  │     SDA → GPIO5   SCL → GPIO6    │  │
-                  │     VCC → 3V3     GND → GND      │  │
-                  └───────────────────────────────────┘
-                                                      │  │
-                                                      │  │
-                                   ┌──────────────────┘  │
-                                   │                      │
-                               ┌───┴───┐                  │
-                               │   O   │  momentary       │
-                               │ button│  push button     │
-                               └───┬───┘                  │
-                                   │                      │
-                                   └──────────────────────┘
-
-Button has two legs: one → GPIO4 (BUTTON_PIN), other → GND.
-No external resistor needed (firmware sets GPIO4 to INPUT_PULLUP,
-idle = HIGH, pressed = LOW).
-```
-
-Keep the button-to-board wiring short if possible; it's a plain digital
-signal (not noise-sensitive like analog), so length only matters if the
-button stand ends up far from the board.
+The button and LED are the only things that need wiring by hand on most
+combo boards — the OLED is normally already soldered to the same PCB.
+(Diagram source: `generate_wiring_diagram.py`, not part of the firmware —
+rerun it if the pinout above changes.)
 
 ## Flashing
 
@@ -94,11 +69,10 @@ port looks empty, enable "USB CDC On Boot" in Tools → USB CDC On Boot.
    Espressif Systems) and the two libraries above.
 2. Select the correct board/port, open `button.ino`, fill in the config
    (including the OLED values above), upload.
-3. Watch the display: `Booting...` → `WiFi: reconnecting` (while
-   joining) → `Ready <ip>` (idle) → `Capturing...` → `Captured!` /
-   `Busy, retry` / `Failed: <code>` (reverts to `Ready` after ~1.5s).
+3. Watch the display/LED through the sequence in "How the trigger works"
+   above.
 
 ## Status
 
-Implemented but **untested on real hardware** — board not yet in hand,
-and the OLED pinout/resolution values are unconfirmed placeholders.
+Implemented but **untested on real hardware** — board not yet in hand, and
+the OLED pinout/resolution values are unconfirmed placeholders.

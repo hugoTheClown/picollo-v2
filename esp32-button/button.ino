@@ -1,5 +1,9 @@
 // Target: ESP32-C3 (e.g. "ESP32-C3 + OLED" combo boards). RISC-V single core,
 // different pinout/strapping than classic ESP32 — see README before flashing.
+//
+// Two-stage trigger: first press arms liveview on the kiosk display (so the
+// guest can see themselves), second press actually takes the photo. A
+// timeout disarms liveview automatically if nobody follows through.
 
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -18,6 +22,11 @@ const uint16_t NUC_PORT = 8080;
 // 2, 8, 9 — avoid those for inputs that must be stable at boot.
 const uint8_t BUTTON_PIN = 4;
 
+// Status LED: one leg to this pin (through a resistor), other to GND.
+// Confirm it's free on the specific board — not all combo boards expose it
+// the same way.
+const uint8_t LED_PIN = 7;
+
 // OLED wiring/size vary by the exact board bought — CONFIRM against the
 // actual module's schematic/listing before flashing.
 const uint8_t OLED_SDA = 5;
@@ -33,13 +42,18 @@ const unsigned long DEBOUNCE_MS = 250;
 const unsigned long WIFI_RETRY_MS = 5000;
 const unsigned long WIFI_GIVE_UP_MS = 120000; // restart if disconnected this long
 const unsigned long RESULT_REVERT_MS = 1500;  // how long a result message stays up
+const unsigned long ARMED_TIMEOUT_MS = 20000; // auto-disarm liveview if no 2nd press
+
+enum State { IDLE, ARMED, CAPTURING, SHOWING_RESULT };
+State state = IDLE;
 
 unsigned long lastPress = 0;
 unsigned long lastWifiAttempt = 0;
 unsigned long disconnectedSince = 0;
+unsigned long armedAt = 0;
 unsigned long resultShownAt = 0;
-bool capturing = false;
-bool showingResult = false;
+unsigned long lastLedToggle = 0;
+bool ledState = false;
 String line1 = "";
 String line2 = "";
 
@@ -61,9 +75,21 @@ void connectWifi() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
+bool postTo(const char *path) {
+  HTTPClient http;
+  String url = "http://" + String(NUC_HOST) + ":" + String(NUC_PORT) + path;
+  http.begin(url);
+  http.setTimeout(5000);
+  int code = http.POST("");
+  http.end();
+  return code == 200;
+}
+
 void setup() {
   Serial.begin(115200);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
 
   Wire.begin(OLED_SDA, OLED_SCL);
   display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR);
@@ -75,9 +101,27 @@ void setup() {
   disconnectedSince = millis();
 }
 
+void armLiveview() {
+  drawStatus(line1, "Zapínám...");
+  if (postTo("/liveview/start")) {
+    state = ARMED;
+    armedAt = millis();
+    digitalWrite(LED_PIN, HIGH); // solid = armed, look at the screen
+  } else {
+    state = SHOWING_RESULT;
+    line2 = "Chyba liveview";
+    resultShownAt = millis();
+  }
+}
+
+void disarmLiveview() {
+  postTo("/liveview/stop");
+  state = IDLE;
+  digitalWrite(LED_PIN, LOW);
+}
+
 void triggerCapture() {
-  capturing = true;
-  drawStatus(line1, "Capturing...");
+  state = CAPTURING;
 
   HTTPClient http;
   String url = "http://" + String(NUC_HOST) + ":" + String(NUC_PORT) + "/capture";
@@ -87,15 +131,29 @@ void triggerCapture() {
   http.end();
 
   if (code == 200) {
-    drawStatus(line1, "Captured!");
+    line2 = "Vyfoceno!";
   } else if (code == 409) {
-    drawStatus(line1, "Busy, retry");
+    line2 = "Obsazeno, zkus znovu";
   } else {
-    drawStatus(line1, "Failed: " + String(code));
+    line2 = "Chyba: " + String(code);
   }
   resultShownAt = millis();
-  showingResult = true;
-  capturing = false;
+  state = SHOWING_RESULT;
+  digitalWrite(LED_PIN, LOW);
+}
+
+void updateLed(unsigned long now) {
+  if (state == CAPTURING) {
+    if (now - lastLedToggle > 100) { // fast blink while capturing
+      lastLedToggle = now;
+      ledState = !ledState;
+      digitalWrite(LED_PIN, ledState);
+    }
+  } else if (state == ARMED) {
+    digitalWrite(LED_PIN, HIGH);
+  } else {
+    digitalWrite(LED_PIN, LOW);
+  }
 }
 
 void loop() {
@@ -103,6 +161,7 @@ void loop() {
 
   if (WiFi.status() != WL_CONNECTED) {
     drawStatus("WiFi: reconnecting", "");
+    digitalWrite(LED_PIN, (now / 500) % 2); // slow blink = disconnected
     if (disconnectedSince == 0) disconnectedSince = now;
 
     if (now - lastWifiAttempt > WIFI_RETRY_MS) {
@@ -117,19 +176,36 @@ void loop() {
   }
 
   disconnectedSince = 0;
+  updateLed(now);
 
-  if (showingResult && now - resultShownAt > RESULT_REVERT_MS) {
-    showingResult = false;
+  if (state == ARMED && now - armedAt > ARMED_TIMEOUT_MS) {
+    disarmLiveview();
   }
 
-  if (!capturing && !showingResult) {
-    drawStatus("Ready  " + WiFi.localIP().toString(), "");
-  } else if (!capturing) {
-    // keep the result message on screen until it reverts
-    drawStatus("Ready  " + WiFi.localIP().toString(), line2);
+  if (state == SHOWING_RESULT && now - resultShownAt > RESULT_REVERT_MS) {
+    state = IDLE;
   }
 
-  if (!capturing && digitalRead(BUTTON_PIN) == LOW && (now - lastPress) > DEBOUNCE_MS) {
+  switch (state) {
+    case IDLE:
+      drawStatus("Ready  " + WiFi.localIP().toString(), "");
+      break;
+    case ARMED:
+      drawStatus("Ready  " + WiFi.localIP().toString(), "Divej se!");
+      break;
+    case CAPTURING:
+      drawStatus("Ready  " + WiFi.localIP().toString(), "Fotim...");
+      break;
+    case SHOWING_RESULT:
+      drawStatus("Ready  " + WiFi.localIP().toString(), line2);
+      break;
+  }
+
+  bool pressed = digitalRead(BUTTON_PIN) == LOW && (now - lastPress) > DEBOUNCE_MS;
+  if (pressed && state == IDLE) {
+    lastPress = now;
+    armLiveview();
+  } else if (pressed && state == ARMED) {
     lastPress = now;
     triggerCapture();
   }

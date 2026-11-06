@@ -53,16 +53,21 @@ selectable via a tablet touchscreen.
   retry/reconnect logic in firmware so a brief WiFi drop doesn't need a
   manual reboot.
 - **Board (2026-11-06, provisional — "zatím"): ESP32-C3 with onboard OLED.**
-  The OLED supersedes the plain-LED status idea with richer status text
-  (WiFi state + IP, capture result) instead of blink patterns.
+- **Final trigger behavior (decided 2026-11-06): two-stage.** First press
+  arms liveview (kiosk display switches from idle screen to the live camera
+  feed, so the guest can see themselves); second press takes the actual
+  photo (liveview auto-stops as part of that). Auto-disarms after ~20s if
+  nobody follows through with the second press.
 - **Implemented** (2026-11-06): `~/photobooth/esp32-button/button.ino`.
-  Button on `INPUT_PULLUP` (default GPIO4, avoids the C3's strapping pins
-  2/8/9), POSTs to `http://<NUC_HOST>:8080/capture` on press. OLED (SSD1306
-  via I2C, Adafruit_GFX/SSD1306 libs) shows `Ready <ip>` when idle,
-  `Capturing...` during a request, then `Captured!` / `Busy, retry` /
-  `Failed: <code>` for ~1.5s. Auto-reconnects on WiFi drop; restarts itself
+  Button on `INPUT_PULLUP` (default GPIO4), separate status **LED**
+  (default GPIO7: solid while armed/liveview, fast blink while capturing,
+  off when idle) — both avoid the C3's strapping pins 2/8/9. First press →
+  `POST /liveview/start`; second press → `POST /capture`. OLED shows
+  `Ready <ip>`, then `Divej se!` while armed, `Fotim...` while capturing,
+  then the result for ~1.5s. Auto-reconnects on WiFi drop; restarts itself
   only if disconnected for 2+ minutes straight.
-  See `esp32-button/README.md` for wiring and flashing steps.
+  See `esp32-button/README.md` (now includes a wiring diagram, `wiring.jpg`)
+  for wiring and flashing steps.
 - **Not yet done:** WIFI_SSID/PASSWORD and NUC_HOST placeholders need real
   values; the OLED's I2C pins/resolution in the sketch are unconfirmed
   guesses (GPIO5/6, 128x64) pending the exact board/listing; untested on
@@ -78,13 +83,35 @@ selectable via a tablet touchscreen.
   - `POST /capture` — triggers `gphoto2 --capture-image-and-download`,
     saves to `~/photobooth/photos/YYYY-MM-DD/HHMMSS.jpg`. Guarded by a
     lock so overlapping triggers don't collide on the single USB camera
-    (returns `409` if a capture is already in progress).
+    (returns `409` if the lock can't be acquired within 5s). Also signals
+    any in-progress `/preview` stream to stop, so a second button press
+    can preempt liveview rather than queue behind it.
+  - `GET /liveview/status`, `POST /liveview/start`, `POST /liveview/stop`
+    (2026-11-06) — tracks whether the kiosk should be showing the live
+    camera feed or its idle screen. Drives the two-stage button flow (see
+    Button section) and the `/kiosk` page, which polls `/liveview/status`
+    to decide what to render.
+  - `GET /gallery` (2026-11-06) — browsable grid of captured photos,
+    newest day first, newest photo first; links to `/photos/<date>/<file>`
+    for the full-size image. No real thumbnail generation yet — the
+    browser just downsizes the full JPEG via CSS, fine on the local booth
+    LAN but would need actual resizing if the photo count/size grows a lot.
   - `POST /background` — placeholder for the tablet's background-selection
     input (future green-screen phase). Currently just echoes the
     selection back; no chroma-key pipeline wired up yet.
-  - `GET /health` — basic liveness check.
-- Runs on `0.0.0.0:8080` (private booth AP only, no auth — matches the
-  network's closed/trusted design elsewhere in this doc).
+  - `GET /health` — basic liveness check. `GET /status` — photos-today
+    count + last capture result, as JSON.
+- `/` is an operator control panel (status, manual "Vyfotit" button,
+  how-it-works, links) — not what the kiosk display shows. The kiosk's
+  fullscreen guest-facing live preview lives at `/kiosk`.
+- Runs on `0.0.0.0:8080`, `threaded=True` (needed once `/preview`'s
+  long-lived streaming connection and other requests like `/capture` can
+  be in flight at the same time) — private booth AP only, no auth (matches
+  the network's closed/trusted design elsewhere in this doc).
+- **Bug found & fixed (2026-11-06):** this camera's `gphoto2` can exit `0`
+  even after a failed capture (observed: PTP Timeout logged to stderr, no
+  file written, exit code still 0) — `/capture` now also checks the output
+  file actually exists, not just the return code.
 - **Storage location note:** photos currently save under
   `~/photobooth/photos/`, not the top-level `/photos/` originally
   sketched in the Storage section — avoids needing root to create/own
@@ -95,11 +122,16 @@ selectable via a tablet touchscreen.
   root entirely. Relies on the user session existing at boot, which the
   planned kiosk auto-login already provides; enabled with
   `systemctl --user enable --now photobooth-listener.service`.
-- Verified end-to-end: POSTing to `/capture` fires the shutter and
-  downloads a real photo to disk.
-- ESP32 firmware POSTing to `/capture` now written (see Button section
-  below) but untested on real hardware. Still not yet done: the
-  green-screen/chroma-key pipeline behind `/background`.
+- Verified end-to-end on 2026-08-18: POSTing to `/capture` fired the
+  shutter and downloaded a real photo to disk. **Currently flaky
+  (2026-11-06):** the camera started timing out on every PTP command,
+  including non-capture ones (`gphoto2 --summary`) — looks like a
+  hardware/USB issue (loose cable, sleep state), not a listener bug; see
+  camera entry in Hardware/OS section. Needs a physical check.
+- ESP32 firmware POSTing to `/capture` and the new `/liveview/*` endpoints
+  now written (see Button section below) but untested on real hardware.
+  Still not yet done: the green-screen/chroma-key pipeline behind
+  `/background`.
 
 ## Storage
 
