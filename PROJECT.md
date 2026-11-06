@@ -139,10 +139,10 @@ selectable via a tablet touchscreen.
 
 ## Network access point
 
-- **Decided: Ubiquiti UniFi Express** — all-in-one router + AP + built-in
-  controller, no separate controller hardware needed. Chosen for reliability
-  and simplicity in a self-contained, portable, event-based deployment
-  (travels between venues rather than a fixed installation).
+- **Decided (updated 2026-11-06): TP-Link TL-WR820N** — self-contained
+  router/AP, no separate controller hardware needed. Chosen for simplicity
+  in a portable, event-based deployment (travels between venues rather
+  than a fixed installation). Admin UI at `http://10.0.2.1/` (login-protected).
 - NUC connects to it via Ethernet; ESP32 button and (later) tablet join it
   over WiFi.
 

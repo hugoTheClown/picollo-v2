@@ -10,7 +10,7 @@
 // ---- Fill these in before flashing ----
 const char *WIFI_SSID = "CHANGE_ME";
 const char *WIFI_PASSWORD = "CHANGE_ME";
-const char *NUC_HOST = "10.0.1.x"; // NUC's address on the booth AP
+const char *NUC_HOST = "10.0.2.10"; // NUC's address on the booth AP — confirm it's a static/reserved lease, not DHCP-drifting
 const uint16_t NUC_PORT = 8080;
 // ----------------------------------------
 

@@ -30,7 +30,7 @@ to run things.
 - **Camera:** Canon EOS 100D, tethered via USB (`gphoto2`/`libgphoto2`).
 - **Button:** ESP32-C3 + OLED display, joins the booth WiFi, triggers
   captures over HTTP.
-- **AP:** Ubiquiti UniFi Express.
+- **AP:** TP-Link TL-WR820N (`http://10.0.2.1/`).
 - Planned but not yet built: tablet (background picker), Shelly smart plug
   (green-screen lighting), printer.
 
