@@ -46,11 +46,35 @@ def capture():
 
 @app.route("/")
 def index():
-    return (
-        '<html><body style="margin:0;background:#000">'
-        '<img src="/preview" style="width:100%;height:100vh;object-fit:contain">'
-        "</body></html>"
-    )
+    return """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Picollo</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📸</text></svg>">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  .preview { width: 100%; height: 100vh; object-fit: contain; display: block; }
+  .banner {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    padding: 18px 24px;
+    background: linear-gradient(to top, rgba(0,0,0,.75), transparent);
+    color: #fff;
+    font-family: system-ui, sans-serif;
+    text-align: center;
+  }
+  .banner h1 { margin: 0; font-size: 1.4em; font-weight: 600; letter-spacing: .03em; }
+  .banner p { margin: 4px 0 0; font-size: .95em; opacity: .85; }
+</style>
+</head>
+<body>
+  <img class="preview" src="/preview" alt="Picollo live preview">
+  <div class="banner">
+    <h1>📸 Picollo</h1>
+    <p>Stiskni tlačítko a vyfoť se!</p>
+  </div>
+</body>
+</html>"""
 
 
 @app.route("/preview")
