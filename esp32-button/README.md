@@ -36,6 +36,47 @@ dropped.
 - ESP32-C3 strapping pins are **2, 8, 9** — avoid reusing these for the
   button or anything that must read stable at boot.
 
+### Trigger (button) wiring diagram
+
+The button is the only thing that needs wiring by hand on most combo
+boards — the OLED is normally already soldered to the same PCB (its I2C
+pins below are shown for reference/confirmation, not a connection you
+have to make yourself).
+
+```
+                       ESP32-C3 + OLED combo board
+                  ┌───────────────────────────────────┐
+                  │                                    │
+   USB-C / 5V ────┤ 5V                                 │
+                  │                                    │
+          GND ────┤ GND ───────────────┬───────────────┤
+                  │                    │               │
+                  │           BUTTON_PIN (GPIO4) ───┐  │
+                  │                                 │  │
+                  │   OLED (on-board, for ref.):     │  │
+                  │     SDA → GPIO5   SCL → GPIO6    │  │
+                  │     VCC → 3V3     GND → GND      │  │
+                  └───────────────────────────────────┘
+                                                      │  │
+                                                      │  │
+                                   ┌──────────────────┘  │
+                                   │                      │
+                               ┌───┴───┐                  │
+                               │   O   │  momentary       │
+                               │ button│  push button     │
+                               └───┬───┘                  │
+                                   │                      │
+                                   └──────────────────────┘
+
+Button has two legs: one → GPIO4 (BUTTON_PIN), other → GND.
+No external resistor needed (firmware sets GPIO4 to INPUT_PULLUP,
+idle = HIGH, pressed = LOW).
+```
+
+Keep the button-to-board wiring short if possible; it's a plain digital
+signal (not noise-sensitive like analog), so length only matters if the
+button stand ends up far from the board.
+
 ## Flashing
 
 Needs the Arduino IDE (or `arduino-cli`) with the ESP32 board package
