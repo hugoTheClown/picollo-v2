@@ -1,19 +1,54 @@
-// Picollo – ESP32-C3 s integrovaným 0.42" OLED (SSD1306, 72x40, I2C) + WiFi
+// Picollo – spoušť: ESP32-C3 s integrovaným 0.42" OLED (SSD1306, 72x40, I2C) + WiFi
+//
+// Dvoufázové ovládání:
+//   1. stisk  -> POST /liveview/start (kiosk ukáže živý obraz, LED svítí)
+//   2. stisk  -> POST /capture        (vyfotí, liveview se na NUC vypne sám)
+//   bez 2. stisku do ARMED_TIMEOUT_MS -> POST /liveview/stop
+//
+// Úlohy:
+//   button_task – čte tlačítko, odfiltruje zákmity, posílá stisky do fronty
+//   booth_task  – stavový automat + HTTP požadavky na NUC (blokující)
+//   ui_task     – každých 100 ms překreslí OLED a nastaví LED, i když
+//                 booth_task zrovna čeká na odpověď
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+#include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_http_client.h"
+#include "esp_system.h"
 #include "nvs_flash.h"
 #include "wifi_secrets.h"
 
+// ---- NUC (listener) ----
+#ifndef NUC_HOST
+#define NUC_HOST    "10.0.2.10"   // adresa NUC na booth AP – musí být statická/rezervovaná
+#endif
+#ifndef NUC_PORT
+#define NUC_PORT    8080
+#endif
+
+// ---- piny ----  (C3 strapping piny 2, 8, 9 nepoužívat)
 #define PIN_SDA     5
 #define PIN_SCL     6
+#define PIN_BUTTON  4             // tlačítko proti GND, interní pull-up
+#define PIN_LED     7             // LED přes rezistor proti GND
 #define OLED_ADDR   0x3C
+
+// ---- časování ----
+#define BTN_STABLE_MS       30      // jak dlouho musí být úroveň stabilní
+#define BTN_LOCKOUT_MS      250     // min. odstup dvou stisků
+#define ARMED_TIMEOUT_MS    20000   // auto-vypnutí liveview bez 2. stisku
+#define RESULT_SHOW_MS      1500    // jak dlouho zůstane výsledek na displeji
+#define HTTP_TIMEOUT_MS     5000    // /liveview/*
+#define CAPTURE_TIMEOUT_MS  40000   // /capture: na NUC až 5 s zámek + 30 s gphoto2
+#define WIFI_GIVE_UP_MS     120000  // restart, když WiFi nejde tak dlouho v kuse
 
 #define OLED_W      72
 #define OLED_H      40
@@ -103,28 +138,50 @@ static void px(int x, int y)
     fb[(y / 8) * OLED_W + x] |= 1 << (y & 7);
 }
 
-// minimální font 5x7 – jen znaky, které potřebujeme
-typedef struct { char c; uint8_t col[5]; } glyph_t;
-static const glyph_t font[] = {
-    {' ', {0x00,0x00,0x00,0x00,0x00}}, {'.', {0x00,0x60,0x60,0x00,0x00}},
-    {'\x01', {0x60,0x00,0x00,0x00,0x00}}, // úzká tečka pro velký text
-    {'0', {0x3E,0x51,0x49,0x45,0x3E}}, {'1', {0x00,0x42,0x7F,0x40,0x00}},
-    {'2', {0x42,0x61,0x51,0x49,0x46}}, {'3', {0x21,0x41,0x45,0x4B,0x31}},
-    {'4', {0x18,0x14,0x12,0x7F,0x10}}, {'5', {0x27,0x45,0x45,0x45,0x39}},
-    {'6', {0x3C,0x4A,0x49,0x49,0x30}}, {'7', {0x01,0x71,0x09,0x05,0x03}},
-    {'8', {0x36,0x49,0x49,0x49,0x36}}, {'9', {0x06,0x49,0x49,0x29,0x1E}},
-    {'F', {0x7F,0x09,0x09,0x09,0x01}}, {'K', {0x7F,0x08,0x14,0x22,0x41}},
-    {'O', {0x3E,0x41,0x41,0x41,0x3E}}, {'P', {0x7F,0x09,0x09,0x09,0x06}},
-    {'W', {0x3F,0x40,0x38,0x40,0x3F}}, {'c', {0x38,0x44,0x44,0x44,0x20}},
-    {'i', {0x00,0x44,0x7D,0x40,0x00}}, {'l', {0x00,0x41,0x7F,0x40,0x00}},
-    {'o', {0x38,0x44,0x44,0x44,0x38}},
+// Klasický font 5x7, ASCII 0x20..0x7E (sloupce, bit 0 = horní řádek).
+static const uint8_t font5x7[][5] = {
+    {0x00,0x00,0x00,0x00,0x00}, {0x00,0x00,0x5F,0x00,0x00}, {0x00,0x07,0x00,0x07,0x00}, // ' ' ! "
+    {0x14,0x7F,0x14,0x7F,0x14}, {0x24,0x2A,0x7F,0x2A,0x12}, {0x23,0x13,0x08,0x64,0x62}, // # $ %
+    {0x36,0x49,0x55,0x22,0x50}, {0x00,0x05,0x03,0x00,0x00}, {0x00,0x1C,0x22,0x41,0x00}, // & ' (
+    {0x00,0x41,0x22,0x1C,0x00}, {0x14,0x08,0x3E,0x08,0x14}, {0x08,0x08,0x3E,0x08,0x08}, // ) * +
+    {0x00,0x50,0x30,0x00,0x00}, {0x08,0x08,0x08,0x08,0x08}, {0x00,0x60,0x60,0x00,0x00}, // , - .
+    {0x20,0x10,0x08,0x04,0x02}, {0x3E,0x51,0x49,0x45,0x3E}, {0x00,0x42,0x7F,0x40,0x00}, // / 0 1
+    {0x42,0x61,0x51,0x49,0x46}, {0x21,0x41,0x45,0x4B,0x31}, {0x18,0x14,0x12,0x7F,0x10}, // 2 3 4
+    {0x27,0x45,0x45,0x45,0x39}, {0x3C,0x4A,0x49,0x49,0x30}, {0x01,0x71,0x09,0x05,0x03}, // 5 6 7
+    {0x36,0x49,0x49,0x49,0x36}, {0x06,0x49,0x49,0x29,0x1E}, {0x00,0x36,0x36,0x00,0x00}, // 8 9 :
+    {0x00,0x56,0x36,0x00,0x00}, {0x08,0x14,0x22,0x41,0x00}, {0x14,0x14,0x14,0x14,0x14}, // ; < =
+    {0x00,0x41,0x22,0x14,0x08}, {0x02,0x01,0x51,0x09,0x06}, {0x32,0x49,0x79,0x41,0x3E}, // > ? @
+    {0x7E,0x11,0x11,0x11,0x7E}, {0x7F,0x49,0x49,0x49,0x36}, {0x3E,0x41,0x41,0x41,0x22}, // A B C
+    {0x7F,0x41,0x41,0x22,0x1C}, {0x7F,0x49,0x49,0x49,0x41}, {0x7F,0x09,0x09,0x09,0x01}, // D E F
+    {0x3E,0x41,0x49,0x49,0x7A}, {0x7F,0x08,0x08,0x08,0x7F}, {0x00,0x41,0x7F,0x41,0x00}, // G H I
+    {0x20,0x40,0x41,0x3F,0x01}, {0x7F,0x08,0x14,0x22,0x41}, {0x7F,0x40,0x40,0x40,0x40}, // J K L
+    {0x7F,0x02,0x0C,0x02,0x7F}, {0x7F,0x04,0x08,0x10,0x7F}, {0x3E,0x41,0x41,0x41,0x3E}, // M N O
+    {0x7F,0x09,0x09,0x09,0x06}, {0x3E,0x41,0x51,0x21,0x5E}, {0x7F,0x09,0x19,0x29,0x46}, // P Q R
+    {0x46,0x49,0x49,0x49,0x31}, {0x01,0x01,0x7F,0x01,0x01}, {0x3F,0x40,0x40,0x40,0x3F}, // S T U
+    {0x1F,0x20,0x40,0x20,0x1F}, {0x3F,0x40,0x38,0x40,0x3F}, {0x63,0x14,0x08,0x14,0x63}, // V W X
+    {0x07,0x08,0x70,0x08,0x07}, {0x61,0x51,0x49,0x45,0x43}, {0x00,0x7F,0x41,0x41,0x00}, // Y Z [
+    {0x02,0x04,0x08,0x10,0x20}, {0x00,0x41,0x41,0x7F,0x00}, {0x04,0x02,0x01,0x02,0x04}, // \ ] ^
+    {0x40,0x40,0x40,0x40,0x40}, {0x00,0x01,0x02,0x04,0x00}, {0x20,0x54,0x54,0x54,0x78}, // _ ` a
+    {0x7F,0x48,0x44,0x44,0x38}, {0x38,0x44,0x44,0x44,0x20}, {0x38,0x44,0x44,0x48,0x7F}, // b c d
+    {0x38,0x54,0x54,0x54,0x18}, {0x08,0x7E,0x09,0x01,0x02}, {0x0C,0x52,0x52,0x52,0x3E}, // e f g
+    {0x7F,0x08,0x04,0x04,0x78}, {0x00,0x44,0x7D,0x40,0x00}, {0x20,0x40,0x44,0x3D,0x00}, // h i j
+    {0x7F,0x10,0x28,0x44,0x00}, {0x00,0x41,0x7F,0x40,0x00}, {0x7C,0x04,0x18,0x04,0x78}, // k l m
+    {0x7C,0x08,0x04,0x04,0x78}, {0x38,0x44,0x44,0x44,0x38}, {0x7C,0x14,0x14,0x14,0x08}, // n o p
+    {0x08,0x14,0x14,0x18,0x7C}, {0x7C,0x08,0x04,0x04,0x08}, {0x48,0x54,0x54,0x54,0x20}, // q r s
+    {0x04,0x3F,0x44,0x40,0x20}, {0x3C,0x40,0x40,0x20,0x7C}, {0x1C,0x20,0x40,0x20,0x1C}, // t u v
+    {0x3C,0x40,0x30,0x40,0x3C}, {0x44,0x28,0x10,0x28,0x44}, {0x0C,0x50,0x50,0x50,0x3C}, // w x y
+    {0x44,0x64,0x54,0x4C,0x44}, {0x00,0x08,0x36,0x41,0x00}, {0x00,0x00,0x7F,0x00,0x00}, // z { |
+    {0x00,0x41,0x36,0x08,0x00}, {0x10,0x08,0x08,0x10,0x08},                             // } ~
 };
+
+#define NARROW_DOT '\x01' // úzká tečka pro velký text (IP adresa)
+static const uint8_t narrow_dot[5] = {0x60,0x00,0x00,0x00,0x00};
 
 static const uint8_t *glyph(char c)
 {
-    for (size_t i = 0; i < sizeof(font) / sizeof(font[0]); i++)
-        if (font[i].c == c) return font[i].col;
-    return font[0].col;
+    if (c == NARROW_DOT) return narrow_dot;
+    if (c < 0x20 || c > 0x7E) c = '?';
+    return font5x7[c - 0x20];
 }
 
 // Proporcionální text: prázdné sloupce glyfu se ořežou.
@@ -167,7 +224,7 @@ static void big_center(int y, const char *src)
     // tečky nahradit úzkou variantou, ať se IP vejde v plné šířce
     char str[24];
     size_t i = 0;
-    for (; src[i] && i < sizeof(str) - 1; i++) str[i] = src[i] == '.' ? '\x01' : src[i];
+    for (; src[i] && i < sizeof(str) - 1; i++) str[i] = src[i] == '.' ? NARROW_DOT : src[i];
     str[i] = '\0';
 
     int sx = 2;
@@ -175,6 +232,42 @@ static void big_center(int y, const char *src)
     if (w > OLED_W) { sx = 1; w = text_ex(0, 0, str, sx, 2, 1, false); }
     text_ex((OLED_W - w) / 2, y, str, sx, 2, 1, true);
 }
+
+// ================= sdílený stav =================
+
+typedef enum {
+    ST_IDLE,       // čeká na 1. stisk
+    ST_ARMING,     // posílá /liveview/start
+    ST_ARMED,      // liveview běží, čeká na 2. stisk
+    ST_CAPTURING,  // posílá /capture
+    ST_RESULT,     // ukazuje výsledek focení / chybu
+} booth_state_t;
+
+static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
+static booth_state_t state = ST_IDLE;   // zapisuje jen booth_task
+static char state_msg[16] = "";         // text pro ST_RESULT
+static TickType_t state_since = 0;      // kdy se do stavu vstoupilo
+
+static void set_state(booth_state_t st, const char *msg)
+{
+    portENTER_CRITICAL(&state_lock);
+    state = st;
+    state_since = xTaskGetTickCount();
+    strlcpy(state_msg, msg ? msg : "", sizeof(state_msg));
+    portEXIT_CRITICAL(&state_lock);
+}
+
+static booth_state_t get_state(char *msg, size_t len, TickType_t *since)
+{
+    portENTER_CRITICAL(&state_lock);
+    booth_state_t st = state;
+    if (since) *since = state_since;
+    if (msg) strlcpy(msg, state_msg, len);
+    portEXIT_CRITICAL(&state_lock);
+    return st;
+}
+
+static QueueHandle_t press_queue;
 
 // ================= WiFi =================
 
@@ -217,6 +310,9 @@ static void wifi_start(void)
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event, NULL));
 
+    // CZ = kanály 1–13; výchozí politika by mohla minout AP na 12/13
+    ESP_ERROR_CHECK(esp_wifi_set_country_code("CZ", true));
+
     wifi_config_t wc = { 0 };
     strncpy((char *)wc.sta.ssid, WIFI_SSID, sizeof(wc.sta.ssid));
     strncpy((char *)wc.sta.password, WIFI_PASSWORD, sizeof(wc.sta.password));
@@ -225,31 +321,229 @@ static void wifi_start(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
-// ================= main =================
+// ================= HTTP =================
 
-void app_main(void)
+// POST bez těla na NUC. Vrací HTTP status, nebo -1 při chybě spojení/timeoutu.
+static int nuc_post(const char *path, int timeout_ms)
 {
-    oled_init();
-    wifi_start();
+    char url[64];
+    snprintf(url, sizeof(url), "http://%s:%d%s", NUC_HOST, NUC_PORT, path);
 
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = timeout_ms,
+    };
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    if (!c) return -1;
+
+    esp_err_t err = esp_http_client_perform(c);
+    int code = err == ESP_OK ? esp_http_client_get_status_code(c) : -1;
+    esp_http_client_cleanup(c);
+
+    if (err != ESP_OK) ESP_LOGW(TAG, "POST %s selhal: %s", path, esp_err_to_name(err));
+    else               ESP_LOGI(TAG, "POST %s -> %d", path, code);
+    return code;
+}
+
+// ================= tlačítko =================
+
+static void button_task(void *arg)
+{
+    int stable = 1, last_raw = 1;          // 1 = uvolněno (pull-up)
+    TickType_t changed_at = 0, last_press = 0;
+    bool first = true;
+
+    for (;;) {
+        int raw = gpio_get_level(PIN_BUTTON);
+        TickType_t now = xTaskGetTickCount();
+
+        if (raw != last_raw) {
+            last_raw = raw;
+            changed_at = now;
+        } else if (raw != stable && now - changed_at >= pdMS_TO_TICKS(BTN_STABLE_MS)) {
+            stable = raw;
+            if (stable == 0 && (first || now - last_press >= pdMS_TO_TICKS(BTN_LOCKOUT_MS))) {
+                first = false;
+                last_press = now;
+                uint8_t ev = 1;
+                xQueueSend(press_queue, &ev, 0);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// ================= stavový automat =================
+
+static void result(const char *msg)
+{
+    set_state(ST_RESULT, msg);
+}
+
+static void do_arm(void)
+{
+    ESP_LOGI(TAG, "1. stisk: zapinam liveview");
+    set_state(ST_ARMING, NULL);
+    int code = nuc_post("/liveview/start", HTTP_TIMEOUT_MS);
+    if (code == 200) {
+        set_state(ST_ARMED, NULL);
+    } else {
+        char msg[16];
+        snprintf(msg, sizeof(msg), code < 0 ? "Bez NUC" : "Chyba %d", code);
+        result(msg);
+    }
+}
+
+static void do_capture(void)
+{
+    ESP_LOGI(TAG, "2. stisk: fotim");
+    set_state(ST_CAPTURING, NULL);
+    int code = nuc_post("/capture", CAPTURE_TIMEOUT_MS);
+    if (code == 200)       result("Vyfoceno!");
+    else if (code == 409)  result("Obsazeno");
+    else if (code < 0)     result("Bez NUC");
+    else {
+        char msg[16];
+        snprintf(msg, sizeof(msg), "Chyba %d", code);
+        result(msg);
+    }
+}
+
+static void booth_task(void *arg)
+{
+    for (;;) {
+        TickType_t entered;
+        booth_state_t st = get_state(NULL, 0, &entered);
+
+        // ARMED a RESULT mají časový limit – na stisk čekáme jen do něj
+        TickType_t wait = portMAX_DELAY;
+        TickType_t limit = st == ST_ARMED  ? pdMS_TO_TICKS(ARMED_TIMEOUT_MS)
+                         : st == ST_RESULT ? pdMS_TO_TICKS(RESULT_SHOW_MS) : 0;
+        if (limit) {
+            TickType_t elapsed = xTaskGetTickCount() - entered;
+            wait = elapsed >= limit ? 0 : limit - elapsed;
+        }
+
+        uint8_t ev;
+        if (xQueueReceive(press_queue, &ev, wait) != pdTRUE) {
+            // vypršel limit
+            if (st == ST_ARMED) {
+                ESP_LOGI(TAG, "Nikdo nezmackl podruhe, vypinam liveview");
+                nuc_post("/liveview/stop", HTTP_TIMEOUT_MS);
+            }
+            set_state(ST_IDLE, NULL);
+            continue;
+        }
+
+        if (!wifi_connected) {
+            ESP_LOGW(TAG, "Stisk ignorovan – WiFi neni pripojena");
+            continue;
+        }
+
+        switch (st) {
+        case ST_IDLE:
+        case ST_RESULT:   do_arm();     break;  // z výsledku lze rovnou začít znovu
+        case ST_ARMED:    do_capture(); break;
+        default:          break;
+        }
+
+        // stisky během čekání na NUC zahodit, ať se nevykonají dodatečně
+        xQueueReset(press_queue);
+    }
+}
+
+// ================= displej + LED =================
+
+static void ui_task(void *arg)
+{
     static const char *const dots[] = { ".", "..", "...", "" };
-    for (unsigned phase = 0;; phase = (phase + 1) % 4) {
+    TickType_t down_since = xTaskGetTickCount();
+    char msg[16];
+
+    for (unsigned tick = 0;; tick++) {
+        TickType_t now = xTaskGetTickCount();
+        bool online = wifi_connected;
+        booth_state_t st = get_state(msg, sizeof(msg), NULL);
+
+        // příliš dlouho bez WiFi -> restart (pomůže i při zaseknutém WiFi stacku)
+        if (online) down_since = now;
+        else if (now - down_since > pdMS_TO_TICKS(WIFI_GIVE_UP_MS)) {
+            ESP_LOGE(TAG, "WiFi nejde %d s, restartuji", WIFI_GIVE_UP_MS / 1000);
+            esp_restart();
+        }
+
+        // LED: bez WiFi pomalu bliká, ARMED svítí, při focení rychle bliká
+        int led = 0;
+        if (!online)                                     led = (tick / 5) & 1;
+        else if (st == ST_ARMED)                         led = 1;
+        else if (st == ST_ARMING || st == ST_CAPTURING)  led = tick & 1;
+        gpio_set_level(PIN_LED, led);
+
         memset(fb, 0, sizeof(fb));
         text_center(1, "Picollo", 1);
 
-        if (wifi_connected) {
-            text_center(11, "WiFi OK", 1);
-            big_center(23, ip_str);
-        } else {
+        if (!online) {
             // "WiFi" + tečky naskakují postupně (1, 2, 3, žádná); šířka se počítá
             // se všemi třemi, aby nápis neposkakoval
             int w = text_width("WiFi...", 1);
             int x = (OLED_W - w) / 2;
             x += text(x, 11, "WiFi", 1) + 1;
-            text(x, 11, dots[phase], 1);
+            text(x, 11, dots[(tick / 5) % 4], 1);
+        } else {
+            switch (st) {
+            case ST_IDLE:
+                text_center(11, "WiFi OK", 1);
+                big_center(23, ip_str);
+                break;
+            case ST_ARMING:
+                text_center(11, "Liveview", 1);
+                big_center(23, "...");
+                break;
+            case ST_ARMED:
+                text_center(11, "Zmackni znovu", 1);
+                big_center(23, "Divej se!");
+                break;
+            case ST_CAPTURING:
+                big_center(17, "Fotim...");
+                break;
+            case ST_RESULT:
+                big_center(17, msg);
+                break;
+            }
         }
 
         oled_flush();
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
+}
+
+// ================= main =================
+
+void app_main(void)
+{
+    gpio_config_t btn = {
+        .pin_bit_mask = 1ULL << PIN_BUTTON,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&btn));
+
+    gpio_config_t led = {
+        .pin_bit_mask = 1ULL << PIN_LED,
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    ESP_ERROR_CHECK(gpio_config(&led));
+    gpio_set_level(PIN_LED, 0);
+
+    press_queue = xQueueCreate(4, sizeof(uint8_t));
+
+    oled_init();
+    wifi_start();
+
+    ESP_LOGI(TAG, "NUC: http://%s:%d", NUC_HOST, NUC_PORT);
+
+    xTaskCreate(ui_task,     "ui",     4096, NULL, 4, NULL);
+    xTaskCreate(button_task, "button", 2048, NULL, 6, NULL);
+    xTaskCreate(booth_task,  "booth",  6144, NULL, 5, NULL);
 }
