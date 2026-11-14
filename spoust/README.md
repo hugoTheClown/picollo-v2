@@ -14,7 +14,7 @@ ESP32-C3FH4, 4 MB flash).
 | Onboard part | Pin | Notes |
 |---|---|---|
 | OLED SSD1306 72x40, I2C `0x3C` | SDA **GPIO5**, SCL **GPIO6** | Confirmed on our board. The visible 72x40 window starts at **column 28** of the controller's RAM (`OLED_XOFS` in `main.c`). Without that offset the text renders garbled. |
-| Blue LED | GPIO8 | Active LOW. GPIO8 is also a strapping pin. |
+| Blue LED | GPIO8 | Active LOW. GPIO8 is also a strapping pin. spoust uses it as the NUC-reachable indicator (see Behaviour). |
 | BOOT button | GPIO9 | Strapping pin. Hold it while plugging in USB to force download mode. |
 | RST button | EN | Resets the chip. |
 
@@ -78,6 +78,13 @@ Two presses, the same flow the listener expects:
 
 - With no second press within 20 s, it sends `POST /liveview/stop` and goes
   back to Ready.
+- After every press the OLED shows a third line, `pressed`, for 3 s, even
+  without Wi-Fi. While it's shown, the state's main message moves to line two
+  in small text.
+- **Onboard blue LED = NUC reachable.** Every 5 s the board sends
+  `GET /health` to the listener. Until 3 checks in a row succeed, the LED
+  flashes for 500 ms on each check. After that it stays on. The first failed
+  check, or a Wi-Fi drop, goes back to flashing.
 - Presses made while a request is still in flight are discarded, and so are
   presses while Wi-Fi is down.
 - If Wi-Fi stays down for 2 minutes, the board restarts itself.
@@ -131,6 +138,12 @@ powershell -ExecutionPolicy Bypass -File docs\wiring.ps1
 ## Status
 
 - OLED (with the column-28 offset) and Wi-Fi are working on real hardware.
-- Button, status LED and the HTTP flow are written but **not yet built or
-  tested on the board**.
+- Tested on the board (2026-11-14): button press, `pressed` line, `/health`
+  check with the blue LED, and `POST /liveview/start` → 200. `POST /capture`
+  reached the NUC but returned 409 (camera lock busy), which is the known
+  gphoto2/camera issue on the NUC side.
+- The external status LED (GPIO7) isn't wired yet.
+- Builds with PlatformIO `espressif32` 8.0.0, which brings ESP-IDF 6.1. The
+  app uses 97% of its 1 MB partition, so expect to make room (for example,
+  turn off HTTPS in the HTTP client) before adding much more.
 - The header pin order is unverified (see above).

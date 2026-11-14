@@ -39,6 +39,7 @@
 #define PIN_SCL     6
 #define PIN_BUTTON  4             // tlačítko proti GND, interní pull-up
 #define PIN_LED     7             // LED přes rezistor proti GND
+#define PIN_LED_OB  8             // modrá LED na desce, svítí v LOW – ukazuje dostupnost NUC
 #define OLED_ADDR   0x3C
 
 // ---- časování ----
@@ -47,8 +48,13 @@
 #define ARMED_TIMEOUT_MS    20000   // auto-vypnutí liveview bez 2. stisku
 #define RESULT_SHOW_MS      1500    // jak dlouho zůstane výsledek na displeji
 #define HTTP_TIMEOUT_MS     5000    // /liveview/*
+#define HEALTH_PERIOD_MS    5000    // jak často se ptát NUC na /health
+#define HEALTH_TIMEOUT_MS   2000
+#define HEALTH_OK_NEEDED    3       // tolik úspěchů v řadě -> LED na desce svítí
+#define HEALTH_BLINK_MS     500     // bliknutí LED na desce při každém pokusu, než NUC odpoví
 #define CAPTURE_TIMEOUT_MS  40000   // /capture: na NUC až 5 s zámek + 30 s gphoto2
 #define WIFI_GIVE_UP_MS     120000  // restart, když WiFi nejde tak dlouho v kuse
+#define PRESS_SHOW_MS       3000    // jak dlouho je po stisku vidět "pressed"
 
 #define OLED_W      72
 #define OLED_H      40
@@ -245,7 +251,7 @@ typedef enum {
 
 static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
 static booth_state_t state = ST_IDLE;   // zapisuje jen booth_task
-static char state_msg[16] = "";         // text pro ST_RESULT
+static char state_msg[20] = "";         // text pro ST_RESULT
 static TickType_t state_since = 0;      // kdy se do stavu vstoupilo
 
 static void set_state(booth_state_t st, const char *msg)
@@ -268,6 +274,7 @@ static booth_state_t get_state(char *msg, size_t len, TickType_t *since)
 }
 
 static QueueHandle_t press_queue;
+static volatile TickType_t press_shown_until = 0;  // do kdy je na displeji "pressed"
 
 // ================= WiFi =================
 
@@ -324,14 +331,14 @@ static void wifi_start(void)
 // ================= HTTP =================
 
 // POST bez těla na NUC. Vrací HTTP status, nebo -1 při chybě spojení/timeoutu.
-static int nuc_post(const char *path, int timeout_ms)
+static int nuc_request(esp_http_client_method_t method, const char *path, int timeout_ms, bool log)
 {
     char url[64];
     snprintf(url, sizeof(url), "http://%s:%d%s", NUC_HOST, NUC_PORT, path);
 
     esp_http_client_config_t cfg = {
         .url = url,
-        .method = HTTP_METHOD_POST,
+        .method = method,
         .timeout_ms = timeout_ms,
     };
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
@@ -341,9 +348,53 @@ static int nuc_post(const char *path, int timeout_ms)
     int code = err == ESP_OK ? esp_http_client_get_status_code(c) : -1;
     esp_http_client_cleanup(c);
 
-    if (err != ESP_OK) ESP_LOGW(TAG, "POST %s selhal: %s", path, esp_err_to_name(err));
-    else               ESP_LOGI(TAG, "POST %s -> %d", path, code);
+    if (log) {
+        const char *m = method == HTTP_METHOD_GET ? "GET" : "POST";
+        if (err != ESP_OK) ESP_LOGW(TAG, "%s %s selhal: %s", m, path, esp_err_to_name(err));
+        else               ESP_LOGI(TAG, "%s %s -> %d", m, path, code);
+    }
     return code;
+}
+
+static int nuc_post(const char *path, int timeout_ms)
+{
+    return nuc_request(HTTP_METHOD_POST, path, timeout_ms, true);
+}
+
+// ================= kontrola NUC =================
+
+// Každých HEALTH_PERIOD_MS GET /health. LED na desce:
+//   - dokud není HEALTH_OK_NEEDED úspěchů v řadě: při každém pokusu blikne na 500 ms
+//   - pak svítí trvale; první neúspěch (nebo výpadek WiFi) vrátí blikání
+static void led_ob(bool on) { gpio_set_level(PIN_LED_OB, on ? 0 : 1); }  // aktivní v LOW
+
+static void health_task(void *arg)
+{
+    int ok_streak = 0;
+    bool healthy = false;
+    TickType_t last = xTaskGetTickCount();
+
+    for (;;) {
+        if (!healthy) {           // zkoušíme -> bliknout
+            led_ob(true);
+            vTaskDelay(pdMS_TO_TICKS(HEALTH_BLINK_MS));
+            led_ob(false);
+        }
+
+        bool ok = wifi_connected && nuc_request(HTTP_METHOD_GET, "/health", HEALTH_TIMEOUT_MS, false) == 200;
+        ok_streak = ok ? ok_streak + 1 : 0;
+
+        bool now_healthy = ok_streak >= HEALTH_OK_NEEDED;
+        if (now_healthy != healthy) {
+            healthy = now_healthy;
+            led_ob(healthy);
+            ESP_LOGI(TAG, "NUC %s", healthy ? "dostupny (LED sviti)" : "nedostupny (LED blika)");
+        } else if (!ok && wifi_connected) {
+            ESP_LOGW(TAG, "NUC /health neodpovida");
+        }
+
+        vTaskDelayUntil(&last, pdMS_TO_TICKS(HEALTH_PERIOD_MS));
+    }
 }
 
 // ================= tlačítko =================
@@ -366,6 +417,8 @@ static void button_task(void *arg)
             if (stable == 0 && (first || now - last_press >= pdMS_TO_TICKS(BTN_LOCKOUT_MS))) {
                 first = false;
                 last_press = now;
+                press_shown_until = now + pdMS_TO_TICKS(PRESS_SHOW_MS);
+                ESP_LOGI(TAG, "Stisk tlacitka");
                 uint8_t ev = 1;
                 xQueueSend(press_queue, &ev, 0);
             }
@@ -389,7 +442,7 @@ static void do_arm(void)
     if (code == 200) {
         set_state(ST_ARMED, NULL);
     } else {
-        char msg[16];
+        char msg[20];
         snprintf(msg, sizeof(msg), code < 0 ? "Bez NUC" : "Chyba %d", code);
         result(msg);
     }
@@ -404,7 +457,7 @@ static void do_capture(void)
     else if (code == 409)  result("Obsazeno");
     else if (code < 0)     result("Bez NUC");
     else {
-        char msg[16];
+        char msg[20];
         snprintf(msg, sizeof(msg), "Chyba %d", code);
         result(msg);
     }
@@ -459,7 +512,7 @@ static void ui_task(void *arg)
 {
     static const char *const dots[] = { ".", "..", "...", "" };
     TickType_t down_since = xTaskGetTickCount();
-    char msg[16];
+    char msg[20];
 
     for (unsigned tick = 0;; tick++) {
         TickType_t now = xTaskGetTickCount();
@@ -480,6 +533,10 @@ static void ui_task(void *arg)
         else if (st == ST_ARMING || st == ST_CAPTURING)  led = tick & 1;
         gpio_set_level(PIN_LED, led);
 
+        // po stisku se na PRESS_SHOW_MS ukáže 3. řádek "pressed" (odezva tlačítka
+        // i bez WiFi); velký text se mezitím zobrazí malým písmem na 2. řádku
+        bool pressed = (int32_t)(press_shown_until - now) > 0;
+
         memset(fb, 0, sizeof(fb));
         text_center(1, "Picollo", 1);
 
@@ -490,6 +547,15 @@ static void ui_task(void *arg)
             int x = (OLED_W - w) / 2;
             x += text(x, 11, "WiFi", 1) + 1;
             text(x, 11, dots[(tick / 5) % 4], 1);
+            if (pressed) text_center(25, "pressed", 1);
+        } else if (pressed) {
+            const char *line2 = st == ST_IDLE      ? "WiFi OK"
+                              : st == ST_ARMING    ? "Liveview..."
+                              : st == ST_ARMED     ? "Divej se!"
+                              : st == ST_CAPTURING ? "Fotim..."
+                              :                      msg;
+            text_center(11, line2, 1);
+            text_center(25, "pressed", 1);
         } else {
             switch (st) {
             case ST_IDLE:
@@ -530,11 +596,12 @@ void app_main(void)
     ESP_ERROR_CHECK(gpio_config(&btn));
 
     gpio_config_t led = {
-        .pin_bit_mask = 1ULL << PIN_LED,
+        .pin_bit_mask = (1ULL << PIN_LED) | (1ULL << PIN_LED_OB),
         .mode = GPIO_MODE_OUTPUT,
     };
     ESP_ERROR_CHECK(gpio_config(&led));
     gpio_set_level(PIN_LED, 0);
+    gpio_set_level(PIN_LED_OB, 1);  // zhasnuto
 
     press_queue = xQueueCreate(4, sizeof(uint8_t));
 
@@ -546,4 +613,5 @@ void app_main(void)
     xTaskCreate(ui_task,     "ui",     4096, NULL, 4, NULL);
     xTaskCreate(button_task, "button", 2048, NULL, 6, NULL);
     xTaskCreate(booth_task,  "booth",  6144, NULL, 5, NULL);
+    xTaskCreate(health_task, "health", 4096, NULL, 3, NULL);
 }
