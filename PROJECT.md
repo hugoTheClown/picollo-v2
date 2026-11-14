@@ -70,6 +70,10 @@ selectable via a tablet touchscreen.
   for hardware debounce, on top of the firmware's 250ms software debounce.
   See `esp32-button/README.md` (now includes a wiring diagram, `wiring.jpg`)
   for wiring and flashing steps.
+- **Replaced (2026-11-14):** the Arduino sketch in `esp32-button/` (and its
+  `flash.py`) was removed from the repo. It is superseded by `spoust/`, ESP-IDF
+  firmware built with PlatformIO (see `spoust/README.md`). The entries below
+  that mention `esp32-button/` are historical.
 - **Board arrived & flashed (2026-11-06):** plugged into the NUC itself
   (not a separate machine). Installed `arduino-cli` (user-local, no root)
   + the `esp32:esp32` core + libraries, and wrote

@@ -112,15 +112,15 @@ doesn't yet start fully unattended on boot.
 
 ### ESP32-C3 button firmware
 
-Flashed from a separate machine (Arduino IDE), not from the NUC:
+`spoust/`: ESP-IDF firmware built with PlatformIO, no external libraries.
 
-1. Arduino IDE → Boards Manager → install **esp32** (by Espressif Systems).
-2. Library Manager → install **Adafruit SSD1306** and **Adafruit GFX
-   Library** (OLED status display).
-3. Board: "ESP32C3 Dev Module" (or the specific board variant).
-4. Open `esp32-button/button/button.ino`, fill in WiFi/NUC config, upload.
+1. `cp spoust/include/wifi_secrets.h.example spoust/include/wifi_secrets.h`
+   and fill in the WiFi credentials. The file is gitignored.
+2. Set the NUC address (`NUC_HOST` / `NUC_PORT` in `spoust/src/main.c`) if it
+   differs from the default.
+3. `cd spoust && pio run -t upload`
 
-Full wiring, pinout, and flashing details: `esp32-button/README.md`.
+Full wiring, pinout, and flashing details: `spoust/README.md`.
 
 ### Version control
 
@@ -137,7 +137,7 @@ having a secret pass through a remote session's scrollback.
 ```
 photobooth/
 ├── listener/app.py       Flask service: capture, preview, liveview, gallery
-├── esp32-button/          ESP32-C3 firmware + its own README (wiring/flashing)
+├── spoust/                ESP32-C3 firmware (ESP-IDF) + its own README (wiring/flashing)
 ├── photos/                Captured images, YYYY-MM-DD/HHMMSS.jpg (gitignored)
 └── PROJECT.md             Full design log: decisions, status, open questions
 ```
@@ -181,7 +181,7 @@ curl -s http://localhost:8080/liveview/status    # is the kiosk currently showin
 systemctl --user restart photobooth-listener.service
 ```
 
-**Button hardware:** once wired and flashed (see `esp32-button/README.md`),
+**Button hardware:** once wired and flashed (see `spoust/README.md`),
 the physical button drives the same two-stage flow — OLED and status LED
 reflect each stage (idle / armed / capturing / result).
 

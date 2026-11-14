@@ -1,8 +1,8 @@
 # spoust: ESP32-C3 trigger button firmware (ESP-IDF)
 
 Firmware for the booth's physical trigger button. Replaces the Arduino
-sketch in `../esp32-button/`. Built with PlatformIO + ESP-IDF 5.5, with no
-external libraries: the OLED is driven directly through the IDF
+sketch formerly in `esp32-button/` (now removed). Built with PlatformIO +
+ESP-IDF 5.5, with no external libraries: the OLED is driven directly through the IDF
 `i2c_master` driver with a built-in 5x7 font. See `../PROJECT.md` for the
 overall design.
 
