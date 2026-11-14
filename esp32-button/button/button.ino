@@ -98,6 +98,10 @@ void connectWifi() {
   WiFi.onEvent(onWifiEvent);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(true);
+  // Modem sleep (the default) adds ~60-130 ms per round trip while the radio
+  // waits for the next beacon; a button press needs several round trips.
+  // The button is mains/USB powered, so keep the radio awake.
+  WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 

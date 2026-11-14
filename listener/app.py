@@ -1,7 +1,10 @@
+import queue
 import re
-import signal
+import shutil
 import subprocess
+import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -14,100 +17,182 @@ app = Flask(__name__)
 PHOTOS_DIR = Path(__file__).resolve().parent.parent / "photos"
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
-# Held by whoever is talking to the camera: the liveview worker or a capture.
-camera_lock = threading.Lock()
 last_capture = None
 
 
-class LiveView:
-    """Owns the gphoto2 liveview process in a background thread.
+class CameraError(Exception):
+    pass
 
-    The camera stream is decoupled from HTTP clients: any number of browsers
-    can watch /preview, and a browser disconnecting never touches the camera.
 
-    gphoto2 only notices a signal between frames, and it blocks writing to
-    stdout once the pipe fills (a frame is ~300 KB, the pipe holds 64 KB), so
-    the worker keeps draining stdout until EOF even after asking it to stop.
+class Camera:
+    """One long-lived `gphoto2 --shell` session that owns the camera.
+
+    Spawning gphoto2 per photo meant reconnecting to the camera every time
+    and first tearing down the liveview process: ~0.9 s from request to
+    shutter. Keeping a single session open and shooting straight out of
+    liveview brings that down to ~0.25 s.
+
+    A worker thread runs every command, so the camera is only ever driven
+    from one place: it loops `capture-preview` while liveview is on and
+    services capture requests in between. HTTP clients only read the latest
+    frame, so any number of viewers can watch /preview.
     """
 
-    STOP_GRACE = 3  # seconds to exit cleanly after SIGINT before SIGKILL
+    MARKER = "Local directory now"  # printed by `lcd .`, appended to every command
+    PREVIEW_TIMEOUT = 5
+    CAPTURE_TIMEOUT = 20
 
     def __init__(self):
-        self.cond = threading.Condition()
+        self.cond = threading.Condition()  # guards the fields below
         self.frame = None
         self.seq = 0
-        self.running = False
-        self._ctl = threading.Lock()
-        self._thread = None
+        self._liveview = False
+        self._capture_req = None
+        shm = Path("/dev/shm")
+        self._workdir = Path(tempfile.mkdtemp(prefix="picollo-", dir=shm if shm.is_dir() else None))
         self._proc = None
+        self._lines = None
+        threading.Thread(target=self._worker, daemon=True).start()
 
-    def start(self):
-        """Start liveview. Returns False if the camera is busy with a capture."""
-        with self._ctl:
-            if self._thread and self._thread.is_alive():
-                return True
-            if not camera_lock.acquire(blocking=False):
-                return False
-            self._proc = subprocess.Popen(
-                ["gphoto2", "--stdout", "--capture-movie"],
-                stdout=subprocess.PIPE,
-            )
+    # ---- public API (called from request threads) ----
+
+    @property
+    def running(self):
+        return self._liveview
+
+    def start_liveview(self):
+        with self.cond:
+            self._liveview = True
+            self.cond.notify_all()
+
+    def stop_liveview(self):
+        with self.cond:
+            self._liveview = False
+            self.frame = None
+            self.cond.notify_all()
+
+    def capture(self, dest):
+        """Take a photo into `dest`. Returns None on success, else an error string."""
+        req = {"dest": dest, "done": threading.Event(), "error": None}
+        with self.cond:
+            if self._capture_req is not None:
+                return "busy"
+            self._capture_req = req
+            # Ends liveview on the kiosk; the worker shoots straight out of
+            # liveview without leaving it first, which is what makes it fast.
+            self._liveview = False
+            self.frame = None
+            self.cond.notify_all()
+        if not req["done"].wait(self.CAPTURE_TIMEOUT + 5):
+            return "capture timed out"
+        return req["error"]
+
+    # ---- worker ----
+
+    def _worker(self):
+        viewfinder_on = False
+        while True:
             with self.cond:
-                self.running = True
-                self.frame = None
-            self._thread = threading.Thread(target=self._run, args=(self._proc,), daemon=True)
-            self._thread.start()
-            return True
-
-    def stop(self, timeout=STOP_GRACE + 2):
-        """Stop liveview and wait until the camera is released."""
-        with self._ctl:
-            proc, thread = self._proc, self._thread
-            if not thread:
-                return
-            if proc.poll() is None:
-                proc.send_signal(signal.SIGINT)
-                # Last resort if gphoto2 hangs without exiting; killing it
-                # also closes the pipe so the worker's read returns EOF.
-                threading.Timer(self.STOP_GRACE, lambda: proc.poll() is None and proc.kill()).start()
-            thread.join(timeout)
-
-    def _run(self, proc):
-        buf = bytearray()
-        try:
-            while True:
-                chunk = proc.stdout.read1(65536)
-                if not chunk:
-                    break  # gphoto2 exited (stopped, killed, or camera error)
-                search_from = max(len(buf) - 1, 0)
-                buf += chunk
-                while True:
-                    start = buf.find(b"\xff\xd8")
-                    if start == -1:
-                        del buf[:-1]  # keep a trailing 0xFF in case FFD8 is split
-                        break
-                    end = buf.find(b"\xff\xd9", max(start + 2, search_from))
-                    if end == -1:
-                        del buf[:start]
-                        break
-                    frame = bytes(buf[start : end + 2])
-                    del buf[: end + 2]
-                    search_from = 0
+                self.cond.wait_for(lambda: self._capture_req or self._liveview or viewfinder_on)
+                req, want_liveview = self._capture_req, self._liveview
+            try:
+                if req:
+                    try:
+                        self._capture_to(req["dest"])
+                    except CameraError as e:
+                        req["error"] = str(e)
+                    finally:
+                        with self.cond:
+                            self._capture_req = None
+                        req["done"].set()
+                elif want_liveview:
+                    self._run("capture-preview", self.PREVIEW_TIMEOUT)
+                    viewfinder_on = True
+                    frame = (self._workdir / "capture_preview.jpg").read_bytes()
                     with self.cond:
-                        self.frame = frame
-                        self.seq += 1
-                        self.cond.notify_all()
-        finally:
-            proc.stdout.close()
-            proc.wait()
-            with self.cond:
-                self.running = False
-                self.frame = None
-                self.cond.notify_all()
-            camera_lock.release()
+                        if self._liveview:
+                            self.frame = frame
+                            self.seq += 1
+                            self.cond.notify_all()
+                    continue
+                if viewfinder_on:
+                    # Liveview ended: drop the mirror so the camera isn't left
+                    # with its sensor exposed and the screen on.
+                    viewfinder_on = False
+                    self._run("set-config viewfinder=0", self.PREVIEW_TIMEOUT)
+            except (CameraError, OSError) as e:
+                app.logger.warning("camera: %s", e)
+                self._kill()
+                viewfinder_on = False
+                time.sleep(1)  # don't spin if the camera is unplugged/off
+
+    def _capture_to(self, dest):
+        # A session that died (camera auto-off, replugged) fails the first
+        # command; retry once on a fresh session if no photo was taken.
+        for attempt in (1, 2):
+            for old in self._workdir.glob("capt*"):
+                old.unlink()
+            try:
+                self._run("capture-image-and-download", self.CAPTURE_TIMEOUT)
+            except CameraError:
+                if attempt == 2 or list(self._workdir.glob("capt*")):
+                    raise
+                self._kill()
+                continue
+            shots = sorted(self._workdir.glob("capt*"))
+            if not shots:
+                raise CameraError("gphoto2 reported success but no file was downloaded")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(shots[-1]), dest)
+            return
+
+    def _run(self, command, timeout):
+        """Run one shell command; raises CameraError on gphoto2 errors."""
+        self._ensure_session()
+        self._proc.stdin.write(f"{command}\nlcd .\n")
+        self._proc.stdin.flush()
+        out, deadline = [], time.monotonic() + timeout
+        while True:
+            try:
+                line = self._lines.get(timeout=max(deadline - time.monotonic(), 0))
+            except queue.Empty:
+                self._kill()
+                raise CameraError(f"'{command}' timed out after {timeout}s")
+            if line is None:
+                self._kill()
+                raise CameraError(f"gphoto2 exited during '{command}': {''.join(out).strip()[-300:]}")
+            if self.MARKER in line:
+                break
+            out.append(line)
+        errors = [l.strip() for l in out if "*** Error" in l or "ERROR:" in l]
+        if errors:
+            raise CameraError(f"'{command}': " + " ".join(errors))
+
+    def _ensure_session(self):
+        if self._proc and self._proc.poll() is None:
+            return
+        self._proc = subprocess.Popen(
+            ["gphoto2", "--shell", "--force-overwrite"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            cwd=self._workdir, text=True, errors="replace", bufsize=1,
+        )
+        lines = self._lines = queue.Queue()
+
+        def pump(stream):
+            for line in stream:
+                lines.put(line)
+            lines.put(None)  # EOF
+
+        threading.Thread(target=pump, args=(self._proc.stdout,), daemon=True).start()
+
+    def _kill(self):
+        if self._proc:
+            self._proc.kill()
+            self._proc.wait()
+            self._proc = None
 
 
-liveview = LiveView()
+camera = Camera()
 
 
 # Changes on every listener restart; open kiosk pages reload when it does so
@@ -129,19 +214,18 @@ def status():
 
 @app.route("/liveview/status", methods=["GET"])
 def liveview_status():
-    return jsonify(active=liveview.running, boot_id=BOOT_ID)
+    return jsonify(active=camera.running, boot_id=BOOT_ID)
 
 
 @app.route("/liveview/start", methods=["POST"])
 def liveview_start():
-    if not liveview.start():
-        return jsonify(status="busy", error="capture in progress", active=False), 409
+    camera.start_liveview()
     return jsonify(status="ok", active=True)
 
 
 @app.route("/liveview/stop", methods=["POST"])
 def liveview_stop():
-    liveview.stop()
+    camera.stop_liveview()
     return jsonify(status="ok", active=False)
 
 
@@ -149,41 +233,18 @@ def liveview_stop():
 def capture():
     global last_capture
 
-    # Free the camera from liveview (blocks until gphoto2 has exited), then
-    # take the lock; a timeout here means another capture is still running.
-    liveview.stop()
+    now = datetime.now()
+    filename = PHOTOS_DIR / now.strftime("%Y-%m-%d") / f"{now.strftime('%H%M%S')}.jpg"
 
-    if not camera_lock.acquire(timeout=10):
+    error = camera.capture(filename)
+    if error == "busy":
         return jsonify(status="busy", error="capture already in progress"), 409
+    if error:
+        last_capture = {"status": "error", "error": error, "at": now.isoformat()}
+        return jsonify(last_capture), 504 if "timed out" in error else 500
 
-    try:
-        now = datetime.now()
-        day_dir = PHOTOS_DIR / now.strftime("%Y-%m-%d")
-        day_dir.mkdir(parents=True, exist_ok=True)
-        filename = day_dir / f"{now.strftime('%H%M%S')}.jpg"
-
-        result = subprocess.run(
-            ["gphoto2", "--capture-image-and-download", "--filename", str(filename)],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-
-        # gphoto2 can exit 0 even after a failed capture (e.g. a PTP
-        # timeout logged to stderr) — the file actually landing on disk is
-        # the real signal of success, not just the exit code.
-        if result.returncode != 0 or not filename.exists():
-            error = result.stderr.strip() or "gphoto2 reported success but no file was written"
-            last_capture = {"status": "error", "error": error, "at": now.isoformat()}
-            return jsonify(last_capture), 500
-
-        last_capture = {"status": "ok", "file": str(filename), "at": now.isoformat()}
-        return jsonify(last_capture)
-    except subprocess.TimeoutExpired:
-        last_capture = {"status": "error", "error": "capture timed out", "at": now.isoformat()}
-        return jsonify(last_capture), 504
-    finally:
-        camera_lock.release()
+    last_capture = {"status": "ok", "file": str(filename), "at": now.isoformat()}
+    return jsonify(last_capture)
 
 
 FAVICON = (
@@ -535,19 +596,19 @@ def serve_photo(date, filename):
 def preview():
     # Just a viewer: streams the worker's latest frames. Any number of
     # clients can watch; disconnecting has no effect on the camera.
-    if not liveview.running:
+    if not camera.running:
         return jsonify(status="idle", error="liveview not running"), 503
 
     def generate():
         last_seq = -1
         while True:
-            with liveview.cond:
-                liveview.cond.wait_for(
-                    lambda: liveview.seq != last_seq or not liveview.running, timeout=5
+            with camera.cond:
+                camera.cond.wait_for(
+                    lambda: camera.seq != last_seq or not camera.running, timeout=5
                 )
-                if not liveview.running:
+                if not camera.running:
                     return
-                frame, last_seq = liveview.frame, liveview.seq
+                frame, last_seq = camera.frame, camera.seq
             if frame is None:
                 continue
             yield (
