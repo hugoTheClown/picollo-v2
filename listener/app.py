@@ -364,6 +364,15 @@ def index():
     background: #e8453c; color: #fff; cursor: pointer; margin-bottom: 20px;
   }}
   #shoot:disabled {{ background: #555; cursor: default; }}
+  #live {{
+    display: block; width: 100%; max-width: 480px; padding: 14px;
+    font-size: 1.05em; font-weight: 600; border: 2px solid #3c8ce8; border-radius: 12px;
+    background: transparent; color: #8ab4ff; cursor: pointer; margin-bottom: 12px;
+  }}
+  #live.on {{ background: #3c8ce8; color: #fff; }}
+  #live:disabled {{ opacity: .5; cursor: default; }}
+  #live-link {{ display: block; margin: -4px 0 16px; }}
+  .hidden {{ display: none !important; }}
   #result {{ min-height: 1.4em; margin-bottom: 20px; opacity: .9; }}
   ul {{ margin: 0; padding-left: 20px; }}
   li {{ margin-bottom: 6px; }}
@@ -382,6 +391,8 @@ def index():
     <div class="row"><span>Poslední capture</span><span id="st-last">…</span></div>
   </div>
 
+  <button id="live">Zapnout liveview</button>
+  <a id="live-link" class="hidden" href="/preview" target="_blank">Otevřít liveview ↗</a>
   <button id="shoot">Vyfotit</button>
   <div id="result"></div>
 
@@ -392,6 +403,7 @@ def index():
       <li>2. stisk tlačítka → vyfotí (liveview se automaticky vypne).</li>
       <li>Bez 2. stisku se liveview po chvíli sám vypne.</li>
       <li>Fotka se uloží na NUC do <code>photos/RRRR-MM-DD/HHMMSS.jpg</code>.</li>
+      <li>Tlačítko "Zapnout liveview" výše dělá totéž jako fyzický 1. stisk.</li>
       <li>Tlačítko "Vyfotit" výše dělá totéž jako fyzický 2. stisk — pro test.</li>
       <li>Upload/tisk fotek ještě nejsou zapojené (plánováno později).</li>
     </ul>
@@ -401,6 +413,7 @@ def index():
     <h2>Odkazy</h2>
     <ul>
       <li><a href="/kiosk">/kiosk</a> — fullscreen náhled pro hosty</li>
+      <li><a href="/preview" target="_blank">/preview</a> — samotný liveview stream (jen když je liveview zapnuté)</li>
       <li><a href="/gallery">/gallery</a> — galerie pořízených fotek</li>
       <li><a href="/health">/health</a> — liveness check</li>
       <li><a href="/status">/status</a> — stav v JSON</li>
@@ -408,6 +421,16 @@ def index():
   </div>
 
 <script>
+let liveActive = false;
+function setLive(active) {{
+  liveActive = active;
+  const btn = document.getElementById('live');
+  btn.textContent = active ? 'Vypnout liveview' : 'Zapnout liveview';
+  btn.classList.toggle('on', active);
+  document.getElementById('live-link').classList.toggle('hidden', !active);
+  document.getElementById('st-live').textContent = active ? 'aktivní' : 'vypnuté';
+}}
+
 async function refreshStatus() {{
   try {{
     const h = await fetch('/health').then(r => r.json());
@@ -417,7 +440,7 @@ async function refreshStatus() {{
   }}
   try {{
     const lv = await fetch('/liveview/status').then(r => r.json());
-    document.getElementById('st-live').textContent = lv.active ? 'aktivní' : 'vypnuté';
+    setLive(lv.active);
   }} catch (e) {{}}
   try {{
     const s = await fetch('/status').then(r => r.json());
@@ -446,6 +469,21 @@ document.getElementById('shoot').addEventListener('click', async () => {{
   }}
   btn.disabled = false;
   refreshStatus();
+}});
+
+document.getElementById('live').addEventListener('click', async () => {{
+  const btn = document.getElementById('live');
+  const result = document.getElementById('result');
+  btn.disabled = true;
+  try {{
+    const r = await fetch(liveActive ? '/liveview/stop' : '/liveview/start', {{ method: 'POST' }});
+    const data = await r.json();
+    if (r.ok) {{ setLive(data.active); result.textContent = ''; }}
+    else result.textContent = '⚠️ ' + (data.error || 'chyba');
+  }} catch (e) {{
+    result.textContent = '⚠️ Listener nedostupný';
+  }}
+  btn.disabled = false;
 }});
 
 refreshStatus();
