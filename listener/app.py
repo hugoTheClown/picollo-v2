@@ -1,20 +1,118 @@
 import re
+import signal
 import subprocess
 import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, Response, abort, jsonify, request, send_from_directory, stream_with_context
+from flask import Flask, Response, abort, jsonify, request, send_from_directory
+from markupsafe import escape
 
 app = Flask(__name__)
 
 PHOTOS_DIR = Path(__file__).resolve().parent.parent / "photos"
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
-capture_lock = threading.Lock()
-preview_stop = threading.Event()
+# Held by whoever is talking to the camera: the liveview worker or a capture.
+camera_lock = threading.Lock()
 last_capture = None
-liveview_active = False
+
+
+class LiveView:
+    """Owns the gphoto2 liveview process in a background thread.
+
+    The camera stream is decoupled from HTTP clients: any number of browsers
+    can watch /preview, and a browser disconnecting never touches the camera.
+
+    gphoto2 only notices a signal between frames, and it blocks writing to
+    stdout once the pipe fills (a frame is ~300 KB, the pipe holds 64 KB), so
+    the worker keeps draining stdout until EOF even after asking it to stop.
+    """
+
+    STOP_GRACE = 3  # seconds to exit cleanly after SIGINT before SIGKILL
+
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.frame = None
+        self.seq = 0
+        self.running = False
+        self._ctl = threading.Lock()
+        self._thread = None
+        self._proc = None
+
+    def start(self):
+        """Start liveview. Returns False if the camera is busy with a capture."""
+        with self._ctl:
+            if self._thread and self._thread.is_alive():
+                return True
+            if not camera_lock.acquire(blocking=False):
+                return False
+            self._proc = subprocess.Popen(
+                ["gphoto2", "--stdout", "--capture-movie"],
+                stdout=subprocess.PIPE,
+            )
+            with self.cond:
+                self.running = True
+                self.frame = None
+            self._thread = threading.Thread(target=self._run, args=(self._proc,), daemon=True)
+            self._thread.start()
+            return True
+
+    def stop(self, timeout=STOP_GRACE + 2):
+        """Stop liveview and wait until the camera is released."""
+        with self._ctl:
+            proc, thread = self._proc, self._thread
+            if not thread:
+                return
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGINT)
+                # Last resort if gphoto2 hangs without exiting; killing it
+                # also closes the pipe so the worker's read returns EOF.
+                threading.Timer(self.STOP_GRACE, lambda: proc.poll() is None and proc.kill()).start()
+            thread.join(timeout)
+
+    def _run(self, proc):
+        buf = bytearray()
+        try:
+            while True:
+                chunk = proc.stdout.read1(65536)
+                if not chunk:
+                    break  # gphoto2 exited (stopped, killed, or camera error)
+                search_from = max(len(buf) - 1, 0)
+                buf += chunk
+                while True:
+                    start = buf.find(b"\xff\xd8")
+                    if start == -1:
+                        del buf[:-1]  # keep a trailing 0xFF in case FFD8 is split
+                        break
+                    end = buf.find(b"\xff\xd9", max(start + 2, search_from))
+                    if end == -1:
+                        del buf[:start]
+                        break
+                    frame = bytes(buf[start : end + 2])
+                    del buf[: end + 2]
+                    search_from = 0
+                    with self.cond:
+                        self.frame = frame
+                        self.seq += 1
+                        self.cond.notify_all()
+        finally:
+            proc.stdout.close()
+            proc.wait()
+            with self.cond:
+                self.running = False
+                self.frame = None
+                self.cond.notify_all()
+            camera_lock.release()
+
+
+liveview = LiveView()
+
+
+# Changes on every listener restart; open kiosk pages reload when it does so
+# they never keep running stale JS after a deploy.
+BOOT_ID = uuid.uuid4().hex
 
 
 @app.route("/health", methods=["GET"])
@@ -31,34 +129,31 @@ def status():
 
 @app.route("/liveview/status", methods=["GET"])
 def liveview_status():
-    return jsonify(active=liveview_active)
+    return jsonify(active=liveview.running, boot_id=BOOT_ID)
 
 
 @app.route("/liveview/start", methods=["POST"])
 def liveview_start():
-    global liveview_active
-    liveview_active = True
+    if not liveview.start():
+        return jsonify(status="busy", error="capture in progress", active=False), 409
     return jsonify(status="ok", active=True)
 
 
 @app.route("/liveview/stop", methods=["POST"])
 def liveview_stop():
-    global liveview_active
-    liveview_active = False
-    preview_stop.set()
+    liveview.stop()
     return jsonify(status="ok", active=False)
 
 
 @app.route("/capture", methods=["POST"])
 def capture():
-    global last_capture, liveview_active
+    global last_capture
 
-    # If a liveview preview stream is running, ask it to wind down so the
-    # camera is free for a still capture, then wait (briefly) for the lock.
-    liveview_active = False
-    preview_stop.set()
+    # Free the camera from liveview (blocks until gphoto2 has exited), then
+    # take the lock; a timeout here means another capture is still running.
+    liveview.stop()
 
-    if not capture_lock.acquire(timeout=5):
+    if not camera_lock.acquire(timeout=10):
         return jsonify(status="busy", error="capture already in progress"), 409
 
     try:
@@ -88,7 +183,7 @@ def capture():
         last_capture = {"status": "error", "error": "capture timed out", "at": now.isoformat()}
         return jsonify(last_capture), 504
     finally:
-        capture_lock.release()
+        camera_lock.release()
 
 
 FAVICON = (
@@ -141,14 +236,24 @@ def kiosk():
   </div>
 
 <script>
+const BOOT_ID = '{BOOT_ID}';
 let live = false;
+const img = document.getElementById('previewImg');
+
+// If the stream fails or ends while liveview should be on (e.g. first
+// frame not ready yet), reconnect instead of leaving a black screen.
+function reconnect() {{
+  if (live) setTimeout(() => {{ if (live) img.src = '/preview?t=' + Date.now(); }}, 500);
+}}
+img.addEventListener('error', reconnect);
 
 async function poll() {{
   try {{
-    const r = await fetch('/liveview/status').then(r => r.json());
+    const r = await fetch('/liveview/status', {{ cache: 'no-store' }}).then(r => r.json());
+    if (r.boot_id !== BOOT_ID) {{ location.reload(); return; }}
     if (r.active && !live) {{
       live = true;
-      document.getElementById('previewImg').src = '/preview';
+      document.getElementById('previewImg').src = '/preview?t=' + Date.now();
       document.getElementById('previewImg').classList.remove('hidden');
       document.getElementById('banner').classList.remove('hidden');
       document.getElementById('idleScreen').classList.add('hidden');
@@ -289,8 +394,8 @@ setInterval(refreshStatus, 5000);
 </html>"""
 
 
-@app.route("/gallery")
-def gallery():
+def list_photos_by_day():
+    """[(date, [photo paths])], newest day and newest photo first."""
     days = []
     if PHOTOS_DIR.is_dir():
         for day_dir in sorted(PHOTOS_DIR.iterdir(), reverse=True):
@@ -299,11 +404,17 @@ def gallery():
             photos = sorted(day_dir.glob("*.jpg"), reverse=True)
             if photos:
                 days.append((day_dir.name, photos))
+    return days
+
+
+@app.route("/gallery")
+def gallery():
+    days = list_photos_by_day()
 
     sections = ""
     for day, photos in days:
         thumbs = "".join(
-            f'<a href="/photos/{day}/{p.name}" target="_blank">'
+            f'<a href="/gallery/{day}/{p.name}">'
             f'<img src="/photos/{day}/{p.name}" loading="lazy"></a>'
             for p in photos
         )
@@ -346,6 +457,73 @@ def gallery():
 </html>"""
 
 
+@app.route("/gallery/<date>/<filename>")
+def gallery_photo(date, filename):
+    if not DATE_RE.match(date) or not (PHOTOS_DIR / date / filename).is_file():
+        abort(404)
+    src = f"/photos/{date}/{escape(filename)}"
+
+    # Neighbours in gallery order: "newer" is left/previous, "older" right/next.
+    order = [(day, p.name) for day, photos in list_photos_by_day() for p in photos]
+    i = order.index((date, filename)) if (date, filename) in order else -1
+    newer = f"/gallery/{order[i - 1][0]}/{escape(order[i - 1][1])}" if i > 0 else ""
+    older = f"/gallery/{order[i + 1][0]}/{escape(order[i + 1][1])}" if 0 <= i < len(order) - 1 else ""
+    position = f"{i + 1} / {len(order)}" if i >= 0 else ""
+
+    def arrow(href, label, cls):
+        if href:
+            return f'<a class="nav {cls}" href="{href}" aria-label="{label}">{"‹" if cls == "prev" else "›"}</a>'
+        return f'<span class="nav {cls} off" aria-hidden="true">{"‹" if cls == "prev" else "›"}</span>'
+    return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Picollo — {date} {escape(filename)}</title>
+{FAVICON}
+<style>
+  body {{
+    margin: 0; padding: 20px; background: #111; color: #eee;
+    font-family: system-ui, sans-serif; box-sizing: border-box;
+    min-height: 100vh; display: flex; flex-direction: column;
+  }}
+  .bar {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; gap: 12px; }}
+  .bar a {{ color: #8ab4ff; text-decoration: none; }}
+  .meta {{ opacity: .6; }}
+  .photo {{ flex: 1; display: flex; align-items: center; justify-content: center; gap: 12px; min-height: 0; }}
+  .photo img {{ min-width: 0; max-width: calc(100% - 120px); max-height: calc(100vh - 90px); border-radius: 8px; }}
+  .nav {{
+    flex: none; width: 48px; height: 48px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    background: #1c1c1c; color: #eee; font-size: 2em; line-height: 1;
+    text-decoration: none; user-select: none;
+  }}
+  a.nav:hover {{ background: #2a2a2a; }}
+  .nav.off {{ opacity: .2; }}
+</style>
+</head>
+<body>
+  <div class="bar">
+    <a href="/gallery">← zpět do galerie</a>
+    <span class="meta">{date} · {escape(filename)} · {position}</span>
+    <a href="{src}" target="_blank">originál</a>
+  </div>
+  <div class="photo">
+    {arrow(newer, "Novější fotka", "prev")}
+    <img src="{src}" alt="Fotka {date} {escape(filename)}">
+    {arrow(older, "Starší fotka", "next")}
+  </div>
+<script>
+// Keyboard: ←/→ between photos, Esc back to the gallery.
+document.addEventListener('keydown', e => {{
+  const go = {{ ArrowLeft: '{newer}', ArrowRight: '{older}', Escape: '/gallery' }}[e.key];
+  if (go) location.href = go;
+}});
+</script>
+</body>
+</html>"""
+
+
 @app.route("/photos/<date>/<filename>")
 def serve_photo(date, filename):
     if not DATE_RE.match(date):
@@ -355,50 +533,35 @@ def serve_photo(date, filename):
 
 @app.route("/preview")
 def preview():
-    if not capture_lock.acquire(blocking=False):
-        return jsonify(status="busy", error="camera in use"), 409
-
-    preview_stop.clear()
+    # Just a viewer: streams the worker's latest frames. Any number of
+    # clients can watch; disconnecting has no effect on the camera.
+    if not liveview.running:
+        return jsonify(status="idle", error="liveview not running"), 503
 
     def generate():
-        proc = subprocess.Popen(
-            ["gphoto2", "--stdout", "--capture-movie"],
-            stdout=subprocess.PIPE,
-        )
-        buf = b""
-        try:
-            while not preview_stop.is_set():
-                chunk = proc.stdout.read(4096)
-                if not chunk:
-                    break
-                buf += chunk
-                while True:
-                    start = buf.find(b"\xff\xd8")
-                    if start == -1:
-                        break
-                    end = buf.find(b"\xff\xd9", start + 2)
-                    if end == -1:
-                        break
-                    frame = buf[start : end + 2]
-                    buf = buf[end + 2 :]
-                    yield (
-                        b"--frame\r\n"
-                        b"Content-Type: image/jpeg\r\n"
-                        b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n"
-                        + frame
-                        + b"\r\n"
-                    )
-        finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-            capture_lock.release()
+        last_seq = -1
+        while True:
+            with liveview.cond:
+                liveview.cond.wait_for(
+                    lambda: liveview.seq != last_seq or not liveview.running, timeout=5
+                )
+                if not liveview.running:
+                    return
+                frame, last_seq = liveview.frame, liveview.seq
+            if frame is None:
+                continue
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n"
+                b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n"
+                + frame
+                + b"\r\n"
+            )
 
     return Response(
-        stream_with_context(generate()),
+        generate(),
         mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-store"},
     )
 
 
